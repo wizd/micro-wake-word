@@ -7,9 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LC_ALL=C.UTF-8 \
     MICROWAKEWORD_WORKDIR=/workspace \
     MICROWAKEWORD_VOICE_DIR=/opt/piper-voices \
-    MICROWAKEWORD_VOICE_MODEL_NAME=en_US-lessac-medium.onnx \
-    MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx?download=true" \
-    MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json?download=true"
+    MICROWAKEWORD_VOICE_MODEL_NAME=zh_CN-huayan-medium.onnx \
+    MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
+    MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true"
 
 ENV MICROWAKEWORD_VOICE_MODEL="${MICROWAKEWORD_VOICE_DIR}/${MICROWAKEWORD_VOICE_MODEL_NAME}" \
     MICROWAKEWORD_VOICE_CONFIG="${MICROWAKEWORD_VOICE_MODEL}.json"

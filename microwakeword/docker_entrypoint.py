@@ -55,18 +55,18 @@ DEFAULT_WORKDIR = Path(os.getenv("MICROWAKEWORD_WORKDIR", "/workspace"))
 # when running the container to control this without changing code.
 DEFAULT_TRAIN_BATCH = int(os.getenv("MICROWAKEWORD_TRAIN_BATCH", "256"))
 DEFAULT_VOICE_MODEL = Path(
-    os.getenv("MICROWAKEWORD_VOICE_MODEL", "/opt/piper-voices/en_US-lessac-medium.onnx")
+    os.getenv("MICROWAKEWORD_VOICE_MODEL", "/opt/piper-voices/zh_CN-huayan-medium.onnx")
 )
 DEFAULT_VOICE_CONFIG = Path(
-    os.getenv("MICROWAKEWORD_VOICE_CONFIG", "/opt/piper-voices/en_US-lessac-medium.onnx.json")
+    os.getenv("MICROWAKEWORD_VOICE_CONFIG", "/opt/piper-voices/zh_CN-huayan-medium.onnx.json")
 )
 DEFAULT_VOICE_URL = os.getenv(
     "MICROWAKEWORD_VOICE_URL",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx?download=true",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/zh_CN-huayan-medium.onnx?download=true",
 )
 DEFAULT_VOICE_CONFIG_URL = os.getenv(
     "MICROWAKEWORD_VOICE_CONFIG_URL",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json?download=true",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/zh_CN-huayan-medium.onnx.json?download=true",
 )
 
 
