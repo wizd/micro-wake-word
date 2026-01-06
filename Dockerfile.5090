@@ -1,0 +1,62 @@
+# RTX 5090 专用 Dockerfile
+# 基于 wutzebaer/tensorflow-5090（从源码编译的 TensorFlow，支持 compute capability 12.0）
+FROM wutzebaer/tensorflow-5090
+
+# 确保使用基础镜像的虚拟环境
+ENV VIRTUAL_ENV=/workspace/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    MICROWAKEWORD_WORKDIR=/data \
+    MICROWAKEWORD_VOICE_DIR=/opt/piper-voices \
+    MICROWAKEWORD_VOICE_MODEL_NAME=zh_CN-huayan-medium.onnx \
+    MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
+    MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true"
+
+# 分开设置依赖于前面变量的环境变量
+ENV MICROWAKEWORD_VOICE_MODEL=/opt/piper-voices/zh_CN-huayan-medium.onnx \
+    MICROWAKEWORD_VOICE_CONFIG=/opt/piper-voices/zh_CN-huayan-medium.onnx.json
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        wget \
+        unzip \
+        libsndfile1 \
+        ffmpeg \
+        espeak-ng \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY . /app
+
+# 安装依赖（TensorFlow 已在基础镜像中）
+# 注意：基础镜像使用 Python 3.12，使用 piper-tts 1.3.0（支持 Python 3.12）
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        torch torchaudio \
+        'onnxruntime-gpu>=1.19.0' \
+        'piper-phonemize-cross==1.2.1' \
+        'piper-tts>=1.3.0' \
+        'git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f' \
+        'datasets[audio]' \
+        torchcodec && \
+    pip install --no-cache-dir -e .
+
+RUN mkdir -p /data /app/serve /opt/piper-voices \
+    && wget -O /opt/piper-voices/zh_CN-huayan-medium.onnx "${MICROWAKEWORD_VOICE_URL}" \
+    && wget -O /opt/piper-voices/zh_CN-huayan-medium.onnx.json "${MICROWAKEWORD_VOICE_CONFIG_URL}"
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "microwakeword.docker_entrypoint"]

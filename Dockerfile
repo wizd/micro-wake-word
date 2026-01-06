@@ -1,5 +1,4 @@
-# syntax=docker/dockerfile:1
-FROM python:3.10-slim
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -10,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MICROWAKEWORD_VOICE_MODEL_NAME=zh_CN-huayan-medium.onnx \
     MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
     MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true"
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 ENV MICROWAKEWORD_VOICE_MODEL="${MICROWAKEWORD_VOICE_DIR}/${MICROWAKEWORD_VOICE_MODEL_NAME}" \
     MICROWAKEWORD_VOICE_CONFIG="${MICROWAKEWORD_VOICE_MODEL}.json"
@@ -19,38 +19,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         wget \
         unzip \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
         libsndfile1 \
         ffmpeg \
-    espeak-ng \
+        espeak-ng \
         libglib2.0-0 \
         libsm6 \
         libxext6 \
         libxrender1 \
         libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
 
 WORKDIR /app
 
 COPY . /app
 
-# Install dependencies in order:
-# 1. PyTorch CPU (brings compatible numpy)
-# 2. TensorFlow (will upgrade to numpy 2.x as needed by tf>=2.16)
-# 3. onnxruntime 1.19+ (supports numpy 2.x)
-# 4. Piper dependencies + datasets[audio] extra for complete audio support
-# 5. microwakeword itself (last, so tensorflow requirement is already satisfied)
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.4.1+cpu \
-        torchaudio==2.4.1+cpu && \
-    pip install --no-cache-dir \
-        'onnxruntime>=1.19.0' \
+# Install依赖顺序：
+# 1. PyTorch GPU（cu121）
+# 2. TensorFlow GPU（内置 CUDA/cuDNN）
+# 3. onnxruntime-gpu + 音频依赖
+# 4. 项目本身
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.4.1+cu124 \
+        torchaudio==2.4.1+cu124 && \
+    python -m pip install --no-cache-dir \
+        'tensorflow[and-cuda]==2.17.0' \
+        'onnxruntime-gpu>=1.19.0' \
         'piper-tts==1.2.0' \
         'piper-phonemize-cross==1.2.1' \
         'git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f' \
         'datasets[audio]' && \
-    pip install --no-cache-dir -e .
+    python -m pip install --no-cache-dir -e .
 
 RUN mkdir -p ${MICROWAKEWORD_WORKDIR} /app/serve ${MICROWAKEWORD_VOICE_DIR} \
     && wget -O ${MICROWAKEWORD_VOICE_MODEL} ${MICROWAKEWORD_VOICE_URL} \

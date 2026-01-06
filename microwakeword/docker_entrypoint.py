@@ -69,6 +69,21 @@ DEFAULT_VOICE_CONFIG_URL = os.getenv(
     "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/zh_CN-huayan-medium.onnx.json?download=true",
 )
 
+def should_use_cuda() -> bool:
+    """Decide whether to use CUDA based on env and availability."""
+    flag = os.getenv("MICROWAKEWORD_USE_CUDA", "auto").lower()
+    if flag in ("0", "false", "cpu", "no"):
+        return False
+    if flag in ("1", "true", "yes", "gpu", "cuda"):
+        return True
+    if flag == "auto":
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+    return False
+
 
 class UTCFormatter(logging.Formatter):
     """Formatter that forces UTC timestamps."""
@@ -111,8 +126,9 @@ def ensure_voice_assets() -> tuple[Path, Path]:
 
 def load_voice() -> PiperVoice:
     model_path, config_path = ensure_voice_assets()
+    use_cuda = should_use_cuda()
     logging.info("loading Piper voice from %s", model_path)
-    return PiperVoice.load(str(model_path), config_path=str(config_path), use_cuda=False)
+    return PiperVoice.load(str(model_path), config_path=str(config_path), use_cuda=use_cuda)
 
 
 def synthesize_wakeword_samples(
@@ -342,7 +358,10 @@ def write_training_config(
 
 def run_training_process(config_path: Path, *, workdir: Path) -> None:
     env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+    if should_use_cuda():
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        env.setdefault("CUDA_VISIBLE_DEVICES", "-1")
     env.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
     command = [
