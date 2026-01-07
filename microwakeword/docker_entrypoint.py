@@ -450,10 +450,18 @@ def main() -> None:
         help="Wake word phrase to synthesise and train",
     )
     parser.add_argument(
+        "-s",
+        "--samples-dir",
+        type=str,
+        default=None,
+        help="Path to directory containing pre-generated WAV samples (16kHz, mono, 16-bit). "
+             "If provided, skips Piper TTS synthesis and uses these samples directly.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=DEFAULT_SAMPLE_COUNT,
-        help="Number of synthetic wake word samples to generate",
+        help="Number of synthetic wake word samples to generate (ignored if --samples-dir is provided)",
     )
     parser.add_argument(
         "--sample-batch-size",
@@ -478,9 +486,26 @@ def main() -> None:
     slug = slugify_phrase(wakeword)
     session_dir = DEFAULT_WORKDIR / slug
     serve_dir = session_dir / "serve"
-    samples_dir = session_dir / "generated_samples"
     features_dir = session_dir / "generated_augmented_features"
     negatives_dir = session_dir / "negative_datasets"
+
+    # Determine samples directory: use external if provided, otherwise generate
+    if args.samples_dir:
+        samples_dir = Path(args.samples_dir)
+        if not samples_dir.exists():
+            parser.error(f"Samples directory does not exist: {samples_dir}")
+        wav_files = list(samples_dir.glob("*.wav"))
+        if not wav_files:
+            parser.error(f"No WAV files found in samples directory: {samples_dir}")
+        logging.info(
+            "using %d pre-generated samples from '%s' (skipping Piper TTS)",
+            len(wav_files),
+            samples_dir,
+        )
+        use_external_samples = True
+    else:
+        samples_dir = session_dir / "generated_samples"
+        use_external_samples = False
 
     session_dir.mkdir(parents=True, exist_ok=True)
     serve_dir.mkdir(parents=True, exist_ok=True)
@@ -488,12 +513,13 @@ def main() -> None:
     server, server_thread = start_http_server(serve_dir)
 
     try:
-        ensure_wakeword_samples(
-            wakeword=wakeword,
-            samples_dir=samples_dir,
-            max_samples=args.max_samples,
-            batch_size=args.sample_batch_size,
-        )
+        if not use_external_samples:
+            ensure_wakeword_samples(
+                wakeword=wakeword,
+                samples_dir=samples_dir,
+                max_samples=args.max_samples,
+                batch_size=args.sample_batch_size,
+            )
         ensure_negative_datasets(negatives_dir)
         generate_positive_feature_sets(samples_dir, features_dir)
         config_path, train_dir = write_training_config(

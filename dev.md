@@ -78,3 +78,37 @@ docker run -it --rm \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
   -v /home/wizard/data/microwakeword-data:/data \
   wakeword-5090 -c "嘿！赛赛猫！"
+
+
+# ============================================================
+# 使用自定义语音样本训练（跳过 Piper TTS 合成）
+# ============================================================
+
+# 样本要求：
+#   - 格式：WAV (16kHz, 单声道, 16-bit PCM)
+#   - 命名：任意 *.wav 文件
+#   - 数量：建议 200-500 个
+
+# 3. 使用预生成的语音样本训练
+# 假设你的语音样本在 /home/wizard/data/my-wakeword-samples/ 目录下
+docker run -it --rm \
+  --gpus all \
+  -p 8080:8080 \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v /home/wizard/data/microwakeword-data:/data \
+  -v /home/wizard/data/my-wakeword-samples:/samples:ro \
+  wakeword-5090 -c "嘿！赛赛猫！" -s /samples
+
+# 参数说明：
+#   -c, --wakeword        唤醒词文本（用于命名输出模型）
+#   -s, --samples-dir     预生成语音样本的目录路径
+#   --training-steps      训练步数（默认 10000）
+
+# 示例：使用高质量 TTS 生成的样本
+docker run -it --rm \
+  --gpus all \
+  -p 8080:8080 \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v /home/wizard/data/microwakeword-data:/data \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  wakeword-5090 -c "嘿，赛赛猫！" -s /samples --training-steps 15000
