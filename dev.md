@@ -67,48 +67,95 @@ cd /home/wizard/apps/micro-wake-word
 pip install -e .
 
 
-# 5090 GPU with docker, works, 24min
-# 1. 重新构建镜像
+# ============================================================
+# 5090 GPU with Docker（推荐方式）
+# ============================================================
+#
+# 容器特性：
+#   - 训练完成后自动退出（无 webserver）
+#   - 固定资源（Piper TTS 模型、负样本数据集）内置于镜像
+#   - 动态工作区通过挂载卷分离
+#
+# 挂载点设计：
+#   /samples  - 输入：预生成的语音样本（只读）
+#   /output   - 输出：训练好的 tflite 模型
+#   /cache    - 缓存：训练中间文件（可选，加速重复训练）
+
+# 1. 构建镜像（首次需要，约 10 分钟）
 docker build -f Dockerfile.5090 -t wakeword-5090 .
 
-# 2. 运行（挂载到 /data，不是 /workspace）
-docker run -it --rm \
-  --gpus all \
-  -p 8080:8080 \
+# 2. 基本运行（使用预生成的语音样本）
+docker run --rm --gpus all \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
-  -v /home/wizard/data/microwakeword-data:/data \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/output:/output \
   wakeword-5090 -c "嘿！赛赛猫！"
 
+# 训练完成后：
+#   - 容器自动退出
+#   - 模型保存在 /home/wizard/data/output/<slug>.tflite
 
-# ============================================================
-# 使用自定义语音样本训练（跳过 Piper TTS 合成）
-# ============================================================
-
-# 样本要求：
-#   - 格式：WAV (16kHz, 单声道, 16-bit PCM)
-#   - 命名：任意 *.wav 文件
-#   - 数量：建议 200-500 个
-
-# 3. 使用预生成的语音样本训练
-# 假设你的语音样本在 /home/wizard/data/my-wakeword-samples/ 目录下
-docker run -it --rm \
-  --gpus all \
-  -p 8080:8080 \
+# 3. 带缓存的运行（加速重复训练）
+docker run --rm --gpus all \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
-  -v /home/wizard/data/microwakeword-data:/data \
-  -v /home/wizard/data/my-wakeword-samples:/samples:ro \
-  wakeword-5090 -c "嘿！赛赛猫！" -s /samples
-
-# 参数说明：
-#   -c, --wakeword        唤醒词文本（用于命名输出模型）
-#   -s, --samples-dir     预生成语音样本的目录路径
-#   --training-steps      训练步数（默认 10000）
-
-# 示例：使用高质量 TTS 生成的样本
-docker run -it --rm \
-  --gpus all \
-  -p 8080:8080 \
-  -e MICROWAKEWORD_TRAIN_BATCH=256 \
-  -v /home/wizard/data/microwakeword-data:/data \
   -v /home/wizard/data/voice-samples:/samples:ro \
-  wakeword-5090 -c "嘿，赛赛猫！" -s /samples --training-steps 15000
+  -v /home/wizard/data/output:/output \
+  -v /home/wizard/data/cache:/cache \
+  wakeword-5090 -c "嘿！赛赛猫！"
+
+# ============================================================
+# 自动化脚本示例
+# ============================================================
+
+#!/bin/bash
+# train_wakeword.sh - 同步运行，训练完成后继续执行
+
+WAKEWORD="嘿！赛赛猫！"
+SAMPLES_DIR="./samples"
+OUTPUT_DIR="./output"
+
+mkdir -p "$OUTPUT_DIR"
+
+docker run --rm --gpus all \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v "$SAMPLES_DIR:/samples:ro" \
+  -v "$OUTPUT_DIR:/output" \
+  wakeword-5090 -c "$WAKEWORD"
+
+if [ $? -eq 0 ]; then
+  echo "训练成功！"
+  ls -la "$OUTPUT_DIR"/*.tflite
+else
+  echo "训练失败，退出码: $?"
+  exit 1
+fi
+
+# ============================================================
+# 样本要求
+# ============================================================
+#
+# 格式：WAV (16kHz, 单声道, 16-bit PCM)
+# 命名：任意 *.wav 文件
+# 数量：建议 200-500 个
+
+# ============================================================
+# 参数说明
+# ============================================================
+#
+# -c, --wakeword        唤醒词文本（用于命名输出模型）
+# -s, --samples-dir     预生成语音样本的目录路径（可选，默认使用 /samples）
+# -o, --output-dir      输出目录路径（可选，默认使用 /output）
+# --training-steps      训练步数（默认 10000）
+# --max-samples         合成样本数量（仅当无预生成样本时使用，默认 400）
+
+# ============================================================
+# 高级示例
+# ============================================================
+
+# 使用更多训练步数
+docker run --rm --gpus all \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/output:/output \
+  -v /home/wizard/data/cache:/cache \
+  wakeword-5090 -c "嘿，赛赛猫！" --training-steps 15000

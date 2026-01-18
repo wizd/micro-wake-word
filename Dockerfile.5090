@@ -6,19 +6,30 @@ FROM wutzebaer/tensorflow-5090
 ENV VIRTUAL_ENV=/workspace/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# 基础环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    MICROWAKEWORD_WORKDIR=/data \
-    MICROWAKEWORD_VOICE_DIR=/opt/piper-voices \
-    MICROWAKEWORD_VOICE_MODEL_NAME=zh_CN-huayan-medium.onnx \
-    MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
-    MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true"
+    LC_ALL=C.UTF-8
 
-# 分开设置依赖于前面变量的环境变量
-ENV MICROWAKEWORD_VOICE_MODEL=/opt/piper-voices/zh_CN-huayan-medium.onnx \
+# Piper TTS 语音模型配置
+ENV MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
+    MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true" \
+    MICROWAKEWORD_VOICE_MODEL=/opt/piper-voices/zh_CN-huayan-medium.onnx \
     MICROWAKEWORD_VOICE_CONFIG=/opt/piper-voices/zh_CN-huayan-medium.onnx.json
+
+# 目录配置：分离固定资源与动态工作区
+# 固定资源（镜像内置）：
+#   - /opt/piper-voices: Piper TTS 模型
+#   - /opt/negative-datasets: 负样本数据集
+# 动态工作区（挂载卷）：
+#   - /samples: 输入语音样本
+#   - /output: 输出 tflite 模型
+#   - /cache: 训练中间文件缓存
+ENV MICROWAKEWORD_SAMPLES_DIR=/samples \
+    MICROWAKEWORD_OUTPUT_DIR=/output \
+    MICROWAKEWORD_CACHE_DIR=/cache \
+    MICROWAKEWORD_NEGATIVE_DATASETS_DIR=/opt/negative-datasets
 
 # 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,10 +64,25 @@ RUN pip install --no-cache-dir --upgrade pip && \
         torchcodec && \
     pip install --no-cache-dir -e .
 
-RUN mkdir -p /data /app/serve /opt/piper-voices \
-    && wget -O /opt/piper-voices/zh_CN-huayan-medium.onnx "${MICROWAKEWORD_VOICE_URL}" \
-    && wget -O /opt/piper-voices/zh_CN-huayan-medium.onnx.json "${MICROWAKEWORD_VOICE_CONFIG_URL}"
+# 创建挂载点目录
+RUN mkdir -p /samples /output /cache
 
-EXPOSE 8080
+# 下载固定资源：Piper TTS 语音模型
+RUN mkdir -p /opt/piper-voices && \
+    wget -q -O /opt/piper-voices/zh_CN-huayan-medium.onnx "${MICROWAKEWORD_VOICE_URL}" && \
+    wget -q -O /opt/piper-voices/zh_CN-huayan-medium.onnx.json "${MICROWAKEWORD_VOICE_CONFIG_URL}"
+
+# 下载固定资源：负样本数据集（约 2GB，加速首次运行）
+RUN mkdir -p /opt/negative-datasets && \
+    cd /opt/negative-datasets && \
+    wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/dinner_party.zip" && \
+    wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/dinner_party_eval.zip" && \
+    wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/no_speech.zip" && \
+    wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/speech.zip" && \
+    unzip -q dinner_party.zip && \
+    unzip -q dinner_party_eval.zip && \
+    unzip -q no_speech.zip && \
+    unzip -q speech.zip && \
+    rm -f *.zip
 
 ENTRYPOINT ["python", "-m", "microwakeword.docker_entrypoint"]

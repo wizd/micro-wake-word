@@ -1,4 +1,4 @@
-"""Container entrypoint for training microWakeWord models on CPU."""
+"""Container entrypoint for training microWakeWord models."""
 
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ import time
 import wave
 import zipfile
 from datetime import timedelta
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
@@ -49,11 +47,24 @@ NEGATIVE_DATASETS = {
 DEFAULT_SAMPLE_COUNT = int(os.getenv("MICROWAKEWORD_SAMPLE_COUNT", "400"))
 DEFAULT_BATCH_SIZE = int(os.getenv("MICROWAKEWORD_SAMPLE_BATCH", "50"))
 DEFAULT_TRAINING_STEPS = int(os.getenv("MICROWAKEWORD_TRAINING_STEPS", "10000"))
-DEFAULT_WORKDIR = Path(os.getenv("MICROWAKEWORD_WORKDIR", "/workspace"))
 # Allow overriding the training batch size to avoid OOMs on low-memory machines.
 # Default is 256 for systems with adequate RAM. Set MICROWAKEWORD_TRAIN_BATCH
 # when running the container to control this without changing code.
 DEFAULT_TRAIN_BATCH = int(os.getenv("MICROWAKEWORD_TRAIN_BATCH", "256"))
+
+# Directory configuration for separating fixed assets from dynamic workspace
+# Fixed assets (built into the image):
+#   - Piper TTS voice model
+#   - Negative datasets (pre-downloaded)
+# Dynamic workspace (mounted volumes):
+#   - Input samples
+#   - Output models
+#   - Training cache
+DEFAULT_SAMPLES_DIR = Path(os.getenv("MICROWAKEWORD_SAMPLES_DIR", "/samples"))
+DEFAULT_OUTPUT_DIR = Path(os.getenv("MICROWAKEWORD_OUTPUT_DIR", "/output"))
+DEFAULT_CACHE_DIR = Path(os.getenv("MICROWAKEWORD_CACHE_DIR", "/cache"))
+DEFAULT_NEGATIVE_DIR = Path(os.getenv("MICROWAKEWORD_NEGATIVE_DATASETS_DIR", "/opt/negative-datasets"))
+
 DEFAULT_VOICE_MODEL = Path(
     os.getenv("MICROWAKEWORD_VOICE_MODEL", "/opt/piper-voices/zh_CN-huayan-medium.onnx")
 )
@@ -283,9 +294,12 @@ def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> Non
 
 
 def write_training_config(
-    *, session_dir: Path, slug: str, training_steps: int
+    *, session_dir: Path, slug: str, training_steps: int, negatives_dir: Path
 ) -> tuple[Path, Path]:
     train_dir = Path("trained_models") / slug
+
+    # Use absolute path for negative datasets if they're outside session_dir
+    negatives_path = str(negatives_dir)
 
     config = {
         "window_step_ms": 10,
@@ -300,7 +314,7 @@ def write_training_config(
                 "type": "mmap",
             },
             {
-                "features_dir": "negative_datasets/speech",
+                "features_dir": f"{negatives_path}/speech",
                 "sampling_weight": 10.0,
                 "penalty_weight": 1.0,
                 "truth": False,
@@ -308,7 +322,7 @@ def write_training_config(
                 "type": "mmap",
             },
             {
-                "features_dir": "negative_datasets/dinner_party",
+                "features_dir": f"{negatives_path}/dinner_party",
                 "sampling_weight": 10.0,
                 "penalty_weight": 1.0,
                 "truth": False,
@@ -316,7 +330,7 @@ def write_training_config(
                 "type": "mmap",
             },
             {
-                "features_dir": "negative_datasets/no_speech",
+                "features_dir": f"{negatives_path}/no_speech",
                 "sampling_weight": 5.0,
                 "penalty_weight": 1.0,
                 "truth": False,
@@ -324,7 +338,7 @@ def write_training_config(
                 "type": "mmap",
             },
             {
-                "features_dir": "negative_datasets/dinner_party_eval",
+                "features_dir": f"{negatives_path}/dinner_party_eval",
                 "sampling_weight": 0.0,
                 "penalty_weight": 1.0,
                 "truth": False,
@@ -336,8 +350,8 @@ def write_training_config(
         "positive_class_weight": [1],
         "negative_class_weight": [20],
         "learning_rates": [0.001],
-    # Batch size for training; reduce to lower memory usage on constrained hosts.
-    "batch_size": DEFAULT_TRAIN_BATCH,
+        # Batch size for training; reduce to lower memory usage on constrained hosts.
+        "batch_size": DEFAULT_TRAIN_BATCH,
         "time_mask_max_size": [0],
         "time_mask_count": [0],
         "freq_mask_max_size": [0],
@@ -419,15 +433,6 @@ def locate_tflite_model(train_dir: Path) -> Path:
     return candidate
 
 
-def start_http_server(serve_dir: Path) -> tuple[ThreadingHTTPServer, threading.Thread]:
-    handler = partial(SimpleHTTPRequestHandler, directory=str(serve_dir))
-    server = ThreadingHTTPServer(("0.0.0.0", 8080), handler)
-    thread = threading.Thread(target=server.serve_forever, name="http-server", daemon=True)
-    thread.start()
-    logging.info("http server listening on 0.0.0.0:8080")
-    return server, thread
-
-
 def start_progress_logger(stop_event: threading.Event) -> threading.Thread:
     def _log_status() -> None:
         if stop_event.wait(60):
@@ -455,13 +460,21 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to directory containing pre-generated WAV samples (16kHz, mono, 16-bit). "
-             "If provided, skips Piper TTS synthesis and uses these samples directly.",
+             "If not provided, uses MICROWAKEWORD_SAMPLES_DIR or generates samples using Piper TTS.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Path to output directory for the trained model. "
+             "Defaults to MICROWAKEWORD_OUTPUT_DIR env var or /output.",
     )
     parser.add_argument(
         "--max-samples",
         type=int,
         default=DEFAULT_SAMPLE_COUNT,
-        help="Number of synthetic wake word samples to generate (ignored if --samples-dir is provided)",
+        help="Number of synthetic wake word samples to generate (ignored if samples are provided)",
     )
     parser.add_argument(
         "--sample-batch-size",
@@ -484,12 +497,20 @@ def main() -> None:
         parser.error("Wake word must not be empty")
 
     slug = slugify_phrase(wakeword)
-    session_dir = DEFAULT_WORKDIR / slug
-    serve_dir = session_dir / "serve"
-    features_dir = session_dir / "generated_augmented_features"
-    negatives_dir = session_dir / "negative_datasets"
 
-    # Determine samples directory: use external if provided, otherwise generate
+    # Resolve directory paths from args or environment variables
+    output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
+    cache_dir = DEFAULT_CACHE_DIR
+    negatives_dir = DEFAULT_NEGATIVE_DIR
+
+    # Session directory for training artifacts (in cache)
+    session_dir = cache_dir / slug
+    features_dir = session_dir / "generated_augmented_features"
+
+    # Determine samples directory priority:
+    # 1. Command line --samples-dir
+    # 2. Environment MICROWAKEWORD_SAMPLES_DIR (if it contains wav files)
+    # 3. Generate using Piper TTS
     if args.samples_dir:
         samples_dir = Path(args.samples_dir)
         if not samples_dir.exists():
@@ -503,16 +524,25 @@ def main() -> None:
             samples_dir,
         )
         use_external_samples = True
+    elif DEFAULT_SAMPLES_DIR.exists() and list(DEFAULT_SAMPLES_DIR.glob("*.wav")):
+        samples_dir = DEFAULT_SAMPLES_DIR
+        wav_files = list(samples_dir.glob("*.wav"))
+        logging.info(
+            "using %d pre-generated samples from '%s' (skipping Piper TTS)",
+            len(wav_files),
+            samples_dir,
+        )
+        use_external_samples = True
     else:
         samples_dir = session_dir / "generated_samples"
         use_external_samples = False
 
+    # Ensure directories exist
     session_dir.mkdir(parents=True, exist_ok=True)
-    serve_dir.mkdir(parents=True, exist_ok=True)
-
-    server, server_thread = start_http_server(serve_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # Generate samples if needed
         if not use_external_samples:
             ensure_wakeword_samples(
                 wakeword=wakeword,
@@ -520,15 +550,22 @@ def main() -> None:
                 max_samples=args.max_samples,
                 batch_size=args.sample_batch_size,
             )
+
+        # Ensure negative datasets are available (download if not present)
         ensure_negative_datasets(negatives_dir)
+
+        # Generate feature sets for training
         generate_positive_feature_sets(samples_dir, features_dir)
+
+        # Write training configuration
         config_path, train_dir = write_training_config(
-            session_dir=session_dir, slug=slug, training_steps=args.training_steps
+            session_dir=session_dir,
+            slug=slug,
+            training_steps=args.training_steps,
+            negatives_dir=negatives_dir,
         )
 
-        logging.info(
-            "starting training for '%s' this will take a while", wakeword
-        )
+        logging.info("starting training for '%s' - this will take a while", wakeword)
         start_time = time.time()
         stop_event = threading.Event()
         progress_thread = start_progress_logger(stop_event)
@@ -539,33 +576,22 @@ def main() -> None:
             stop_event.set()
             progress_thread.join(timeout=1)
 
+        # Copy trained model to output directory
         model_path = locate_tflite_model(train_dir)
-        served_model = serve_dir / f"{slug}.tflite"
-        shutil.copy2(model_path, served_model)
+        output_model = output_dir / f"{slug}.tflite"
+        shutil.copy2(model_path, output_model)
 
         duration = timedelta(seconds=int(time.time() - start_time))
         logging.info(
-            "training complete for '%s'; download at http://0.0.0.0:8080/%s.tflite (took %s)",
+            "training complete for '%s'; model saved to %s (took %s)",
             wakeword,
-            slug,
+            output_model,
             duration,
         )
 
-        logging.info(
-            "serving trained models from %s; press Ctrl+C to stop", serve_dir
-        )
-
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            logging.info("shutdown requested, stopping server")
     except Exception as exc:  # pragma: no cover - to aid manual diagnosis
         logging.exception("failed to train wake word model: %s", exc)
         raise SystemExit(1) from exc
-    finally:
-        server.shutdown()
-        server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
