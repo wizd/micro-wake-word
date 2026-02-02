@@ -207,8 +207,10 @@ def ensure_negative_datasets(base_dir: Path) -> None:
     base_dir.mkdir(parents=True, exist_ok=True)
     for archive, folder in NEGATIVE_DATASETS.items():
         target_dir = base_dir / folder
-        manifest = target_dir / "wakeword_mmap" / "manifest.json"
-        if manifest.exists():
+        # Check if the training subdirectory exists and contains mmap data.
+        # The zip files extract to: {folder}/training/*_mmap/ structure.
+        training_dir = target_dir / "training"
+        if training_dir.exists() and any(training_dir.iterdir()):
             logging.info("negative dataset '%s' already present", folder)
             continue
 
