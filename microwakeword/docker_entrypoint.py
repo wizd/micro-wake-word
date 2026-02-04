@@ -64,6 +64,9 @@ DEFAULT_SAMPLES_DIR = Path(os.getenv("MICROWAKEWORD_SAMPLES_DIR", "/samples"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("MICROWAKEWORD_OUTPUT_DIR", "/output"))
 DEFAULT_CACHE_DIR = Path(os.getenv("MICROWAKEWORD_CACHE_DIR", "/cache"))
 DEFAULT_NEGATIVE_DIR = Path(os.getenv("MICROWAKEWORD_NEGATIVE_DATASETS_DIR", "/opt/negative-datasets"))
+DEFAULT_CUSTOM_NEGATIVE_DIR = Path(
+    os.getenv("MICROWAKEWORD_CUSTOM_NEGATIVE_DIR", "/negative-samples")
+)
 
 DEFAULT_VOICE_MODEL = Path(
     os.getenv("MICROWAKEWORD_VOICE_MODEL", "/opt/piper-voices/zh_CN-huayan-medium.onnx")
@@ -295,8 +298,78 @@ def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> Non
         )
 
 
+def generate_custom_negative_feature_sets(samples_dir: Path, features_dir: Path) -> None:
+    features_dir.mkdir(parents=True, exist_ok=True)
+    clips = Clips(
+        input_directory=str(samples_dir),
+        file_pattern="*.wav",
+        remove_silence=False,
+        random_split_seed=10,
+        split_count=0.1,
+    )
+
+    augmenter = Augmentation(
+        augmentation_duration_s=3.2,
+        augmentation_probabilities={
+            "SevenBandParametricEQ": 0.05,
+            "TanhDistortion": 0.05,
+            "PitchShift": 0.05,
+            "BandStopFilter": 0.05,
+            "AddColorNoise": 0.05,
+            "AddBackgroundNoise": 0.0,
+            "Gain": 1.0,
+            "RIR": 0.0,
+        },
+        impulse_paths=[],
+        background_paths=[],
+        background_min_snr_db=-5,
+        background_max_snr_db=10,
+        min_jitter_s=0.195,
+        max_jitter_s=0.205,
+    )
+
+    for split in ("training", "validation", "testing"):
+        split_dir = features_dir / split
+        mmap_dir = split_dir / "custom_negative_mmap"
+        manifest = mmap_dir / "manifest.json"
+        if manifest.exists():
+            logging.info("custom negative features for %s already exist", split)
+            continue
+
+        split_dir.mkdir(parents=True, exist_ok=True)
+
+        if split == "training":
+            split_name = "train"
+            spectrograms = SpectrogramGeneration(
+                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
+            )
+        elif split == "validation":
+            split_name = "validation"
+            spectrograms = SpectrogramGeneration(
+                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
+            )
+        else:
+            split_name = "test"
+            spectrograms = SpectrogramGeneration(
+                clips=clips, augmenter=augmenter, slide_frames=1, step_ms=10
+            )
+
+        logging.info("creating custom negative feature set for %s", split)
+        RaggedMmap.from_generator(
+            out_dir=str(mmap_dir),
+            sample_generator=spectrograms.spectrogram_generator(split=split_name),
+            batch_size=100,
+            verbose=True,
+        )
+
+
 def write_training_config(
-    *, session_dir: Path, slug: str, training_steps: int, negatives_dir: Path
+    *,
+    session_dir: Path,
+    slug: str,
+    training_steps: int,
+    negatives_dir: Path,
+    custom_negative_features_dir: Path | None = None,
 ) -> tuple[Path, Path]:
     train_dir = Path("trained_models") / slug
 
@@ -364,6 +437,18 @@ def write_training_config(
         "minimization_metric": None,
         "maximization_metric": "average_viable_recall",
     }
+
+    if custom_negative_features_dir:
+        config["features"].append(
+            {
+                "features_dir": str(custom_negative_features_dir),
+                "sampling_weight": 5.0,
+                "penalty_weight": 1.0,
+                "truth": False,
+                "truncation_strategy": "random",
+                "type": "mmap",
+            }
+        )
 
     config_path = session_dir / "training_parameters.yaml"
     with config_path.open("w", encoding="utf-8") as file:
@@ -490,6 +575,13 @@ def main() -> None:
         default=DEFAULT_TRAINING_STEPS,
         help="Training steps per iteration",
     )
+    parser.add_argument(
+        "--negative-samples-dir",
+        type=str,
+        default=None,
+        help="Path to directory containing custom negative WAV samples (16kHz, mono, 16-bit). "
+             "These will be added alongside the default negative datasets.",
+    )
     args = parser.parse_args()
 
     configure_logging()
@@ -504,6 +596,7 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
     cache_dir = DEFAULT_CACHE_DIR
     negatives_dir = DEFAULT_NEGATIVE_DIR
+    custom_negative_dir = None
 
     # Session directory for training artifacts (in cache)
     session_dir = cache_dir / slug
@@ -539,6 +632,28 @@ def main() -> None:
         samples_dir = session_dir / "generated_samples"
         use_external_samples = False
 
+    if args.negative_samples_dir:
+        custom_negative_dir = Path(args.negative_samples_dir)
+        if not custom_negative_dir.exists():
+            parser.error(f"Negative samples directory does not exist: {custom_negative_dir}")
+        if not list(custom_negative_dir.glob("*.wav")):
+            parser.error(
+                "No WAV files found in negative samples directory: "
+                f"{custom_negative_dir}"
+            )
+        logging.info(
+            "using custom negative samples from '%s'",
+            custom_negative_dir,
+        )
+    elif DEFAULT_CUSTOM_NEGATIVE_DIR.exists() and list(
+        DEFAULT_CUSTOM_NEGATIVE_DIR.glob("*.wav")
+    ):
+        custom_negative_dir = DEFAULT_CUSTOM_NEGATIVE_DIR
+        logging.info(
+            "using custom negative samples from '%s'",
+            custom_negative_dir,
+        )
+
     # Ensure directories exist
     session_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -558,6 +673,12 @@ def main() -> None:
 
         # Generate feature sets for training
         generate_positive_feature_sets(samples_dir, features_dir)
+        custom_negative_features_dir = None
+        if custom_negative_dir:
+            custom_negative_features_dir = session_dir / "custom_negative_features"
+            generate_custom_negative_feature_sets(
+                custom_negative_dir, custom_negative_features_dir
+            )
 
         # Write training configuration
         config_path, train_dir = write_training_config(
@@ -565,6 +686,7 @@ def main() -> None:
             slug=slug,
             training_steps=args.training_steps,
             negatives_dir=negatives_dir,
+            custom_negative_features_dir=custom_negative_features_dir,
         )
 
         logging.info("starting training for '%s' - this will take a while", wakeword)
