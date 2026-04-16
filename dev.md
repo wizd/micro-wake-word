@@ -78,6 +78,7 @@ pip install -e .
 #
 # 挂载点设计：
 #   /samples  - 输入：预生成的语音样本（只读）
+#   /negative-samples - 输入：自定义负样本（WAV，可选，追加到默认负样本）
 #   /output   - 输出：训练好的 tflite 模型
 #   /cache    - 缓存：训练中间文件（可选，加速重复训练）
 
@@ -102,6 +103,24 @@ docker run --rm --gpus all \
   -v /home/wizard/data/output:/output \
   -v /home/wizard/data/cache:/cache \
   wakeword-5090 -c "嘿！赛赛猫！"
+
+# 4. 追加自定义负样本（不会替换默认 negative-datasets）
+docker run --rm --gpus all \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/negative-samples:/negative-samples:ro \
+  -v /home/wizard/data/output:/output \
+  -v /home/wizard/data/cache:/cache \
+  wakeword-5090 -c "嘿！赛赛猫！"
+
+# 也可显式指定自定义负样本目录（容器内路径）
+docker run --rm --gpus all \
+  -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/custom-neg:/my-negatives:ro \
+  -v /home/wizard/data/output:/output \
+  -v /home/wizard/data/cache:/cache \
+  wakeword-5090 -c "嘿！赛赛猫！" --negative-samples-dir /my-negatives
 
 # ============================================================
 # 自动化脚本示例
@@ -137,6 +156,7 @@ fi
 # 格式：WAV (16kHz, 单声道, 16-bit PCM)
 # 命名：任意 *.wav 文件
 # 数量：建议 200-500 个
+# 说明：自定义负样本会和内置 speech/dinner_party/no_speech/dinner_party_eval 一起训练
 
 # ============================================================
 # 参数说明
@@ -144,9 +164,13 @@ fi
 #
 # -c, --wakeword        唤醒词文本（用于命名输出模型）
 # -s, --samples-dir     预生成语音样本的目录路径（可选，默认使用 /samples）
+# --negative-samples-dir 自定义负样本目录（WAV，可选；会追加到默认负样本）
 # -o, --output-dir      输出目录路径（可选，默认使用 /output）
 # --training-steps      训练步数（默认 10000）
 # --max-samples         合成样本数量（仅当无预生成样本时使用，默认 400）
+
+# 环境变量（可选）
+# MICROWAKEWORD_CUSTOM_NEGATIVE_DIR   自定义负样本目录（默认 /negative-samples）
 
 # ============================================================
 # 高级示例

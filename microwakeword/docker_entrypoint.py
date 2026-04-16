@@ -183,7 +183,7 @@ def ensure_wakeword_samples(
     _ = batch_size  # retained for CLI compatibility
 
     samples_dir.mkdir(parents=True, exist_ok=True)
-    if list(samples_dir.glob("*.wav")):
+    if list(samples_dir.rglob("*.wav")):
         logging.info("wake word samples already exist; skipping synthesis")
         return
 
@@ -232,7 +232,7 @@ def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> Non
     features_dir.mkdir(parents=True, exist_ok=True)
     clips = Clips(
         input_directory=str(samples_dir),
-        file_pattern="*.wav",
+        file_pattern="**/*.wav",
         remove_silence=False,
         random_split_seed=10,
         split_count=0.1,
@@ -302,7 +302,7 @@ def generate_custom_negative_feature_sets(samples_dir: Path, features_dir: Path)
     features_dir.mkdir(parents=True, exist_ok=True)
     clips = Clips(
         input_directory=str(samples_dir),
-        file_pattern="*.wav",
+        file_pattern="**/*.wav",
         remove_silence=False,
         random_split_seed=10,
         split_count=0.1,
@@ -610,7 +610,7 @@ def main() -> None:
         samples_dir = Path(args.samples_dir)
         if not samples_dir.exists():
             parser.error(f"Samples directory does not exist: {samples_dir}")
-        wav_files = list(samples_dir.glob("*.wav"))
+        wav_files = list(samples_dir.rglob("*.wav"))
         if not wav_files:
             parser.error(f"No WAV files found in samples directory: {samples_dir}")
         logging.info(
@@ -619,9 +619,9 @@ def main() -> None:
             samples_dir,
         )
         use_external_samples = True
-    elif DEFAULT_SAMPLES_DIR.exists() and list(DEFAULT_SAMPLES_DIR.glob("*.wav")):
+    elif DEFAULT_SAMPLES_DIR.exists() and list(DEFAULT_SAMPLES_DIR.rglob("*.wav")):
         samples_dir = DEFAULT_SAMPLES_DIR
-        wav_files = list(samples_dir.glob("*.wav"))
+        wav_files = list(samples_dir.rglob("*.wav"))
         logging.info(
             "using %d pre-generated samples from '%s' (skipping Piper TTS)",
             len(wav_files),
@@ -636,7 +636,7 @@ def main() -> None:
         custom_negative_dir = Path(args.negative_samples_dir)
         if not custom_negative_dir.exists():
             parser.error(f"Negative samples directory does not exist: {custom_negative_dir}")
-        if not list(custom_negative_dir.glob("*.wav")):
+        if not list(custom_negative_dir.rglob("*.wav")):
             parser.error(
                 "No WAV files found in negative samples directory: "
                 f"{custom_negative_dir}"
@@ -646,7 +646,7 @@ def main() -> None:
             custom_negative_dir,
         )
     elif DEFAULT_CUSTOM_NEGATIVE_DIR.exists() and list(
-        DEFAULT_CUSTOM_NEGATIVE_DIR.glob("*.wav")
+        DEFAULT_CUSTOM_NEGATIVE_DIR.rglob("*.wav")
     ):
         custom_negative_dir = DEFAULT_CUSTOM_NEGATIVE_DIR
         logging.info(
