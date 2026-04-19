@@ -51,6 +51,8 @@ DEFAULT_TRAINING_STEPS = int(os.getenv("MICROWAKEWORD_TRAINING_STEPS", "10000"))
 # Default is 256 for systems with adequate RAM. Set MICROWAKEWORD_TRAIN_BATCH
 # when running the container to control this without changing code.
 DEFAULT_TRAIN_BATCH = int(os.getenv("MICROWAKEWORD_TRAIN_BATCH", "256"))
+DEFAULT_HARD_NEG_PENALTY = float(os.getenv("MICROWAKEWORD_HARD_NEG_PENALTY", "3.0"))
+DEFAULT_HARD_NEG_SAMPLING = float(os.getenv("MICROWAKEWORD_HARD_NEG_SAMPLING", "10.0"))
 
 # Directory configuration for separating fixed assets from dynamic workspace
 # Fixed assets (built into the image):
@@ -370,6 +372,8 @@ def write_training_config(
     training_steps: int,
     negatives_dir: Path,
     custom_negative_features_dir: Path | None = None,
+    hard_negative_penalty_weight: float = DEFAULT_HARD_NEG_PENALTY,
+    hard_negative_sampling_weight: float = DEFAULT_HARD_NEG_SAMPLING,
 ) -> tuple[Path, Path]:
     train_dir = Path("trained_models") / slug
 
@@ -442,8 +446,8 @@ def write_training_config(
         config["features"].append(
             {
                 "features_dir": str(custom_negative_features_dir),
-                "sampling_weight": 5.0,
-                "penalty_weight": 1.0,
+                "sampling_weight": hard_negative_sampling_weight,
+                "penalty_weight": hard_negative_penalty_weight,
                 "truth": False,
                 "truncation_strategy": "random",
                 "type": "mmap",
@@ -582,6 +586,21 @@ def main() -> None:
         help="Path to directory containing custom negative WAV samples (16kHz, mono, 16-bit). "
              "These will be added alongside the default negative datasets.",
     )
+    parser.add_argument(
+        "--hard-negative-penalty-weight",
+        type=float,
+        default=DEFAULT_HARD_NEG_PENALTY,
+        help=(
+            "Penalty multiplier for custom hard-negative samples. "
+            "Final loss weight = penalty_weight * negative_class_weight."
+        ),
+    )
+    parser.add_argument(
+        "--hard-negative-sampling-weight",
+        type=float,
+        default=DEFAULT_HARD_NEG_SAMPLING,
+        help="Sampling weight for how frequently custom hard-negative samples are drawn.",
+    )
     args = parser.parse_args()
 
     configure_logging()
@@ -687,6 +706,8 @@ def main() -> None:
             training_steps=args.training_steps,
             negatives_dir=negatives_dir,
             custom_negative_features_dir=custom_negative_features_dir,
+            hard_negative_penalty_weight=args.hard_negative_penalty_weight,
+            hard_negative_sampling_weight=args.hard_negative_sampling_weight,
         )
 
         logging.info("starting training for '%s' - this will take a while", wakeword)

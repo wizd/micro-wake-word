@@ -68,50 +68,70 @@ pip install -e .
 
 
 # ============================================================
-# 5090 GPU with Docker（推荐方式）
+# 通用 Docker（GPU / CPU）
 # ============================================================
 #
 # 容器特性：
 #   - 训练完成后自动退出（无 webserver）
-#   - 固定资源（Piper TTS 模型、负样本数据集）内置于镜像
+#   - 固定资源（Piper TTS 模型、默认负样本数据集）内置于镜像
 #   - 动态工作区通过挂载卷分离
 #
 # 挂载点设计：
-#   /samples  - 输入：预生成的语音样本（只读）
+#   /samples  - 输入：预生成语音样本（只读）
 #   /negative-samples - 输入：自定义负样本（WAV，可选，追加到默认负样本）
 #   /output   - 输出：训练好的 tflite 模型
 #   /cache    - 缓存：训练中间文件（可选，加速重复训练）
 
-# 1. 构建镜像（首次需要，约 10 分钟）
-docker build -f Dockerfile.5090 -t wakeword-5090 .
+# 1. 构建 GPU 镜像（默认；支持 RTX 2080/30/40 系列）
+docker build -t wakeword .
+# 或显式指定
+docker build --build-arg DEVICE=gpu -t wakeword .
 
-# 2. 基本运行（使用预生成的语音样本）
+# 2. 构建 CPU-only 镜像
+docker build --build-arg DEVICE=cpu -t wakeword-cpu .
+
+# 3. GPU 基本运行（使用预生成语音样本）
 docker run --rm --gpus all \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
   -v /home/wizard/data/voice-samples:/samples:ro \
   -v /home/wizard/data/output:/output \
-  wakeword-5090 -c "嘿！赛赛猫！"
+  wakeword -c "嘿！赛赛猫！"
 
-# 训练完成后：
-#   - 容器自动退出
-#   - 模型保存在 /home/wizard/data/output/<slug>.tflite
+# 4. CPU-only 运行
+docker run --rm \
+  -e MICROWAKEWORD_USE_CUDA=false \
+  -e MICROWAKEWORD_TRAIN_BATCH=128 \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/output:/output \
+  wakeword-cpu -c "嘿！赛赛猫！"
 
-# 3. 带缓存的运行（加速重复训练）
+# 5. GPU 带缓存运行
 docker run --rm --gpus all \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
   -v /home/wizard/data/voice-samples:/samples:ro \
   -v /home/wizard/data/output:/output \
   -v /home/wizard/data/cache:/cache \
-  wakeword-5090 -c "嘿！赛赛猫！"
+  wakeword -c "嘿！赛赛猫！"
 
-# 4. 追加自定义负样本（不会替换默认 negative-datasets）
+# 5b. CPU-only 带缓存运行
+docker run --rm \
+  -e MICROWAKEWORD_USE_CUDA=false \
+  -e MICROWAKEWORD_TRAIN_BATCH=128 \
+  -v /home/wizard/data/voice-samples:/samples:ro \
+  -v /home/wizard/data/output:/output \
+  -v /home/wizard/data/cache:/cache \
+  wakeword-cpu -c "嘿！赛赛猫！"
+
+# 6. 追加自定义负样本（不会替换默认 negative-datasets）
 docker run --rm --gpus all \
   -e MICROWAKEWORD_TRAIN_BATCH=256 \
+  -e MICROWAKEWORD_HARD_NEG_PENALTY=3.0 \
+  -e MICROWAKEWORD_HARD_NEG_SAMPLING=10.0 \
   -v /home/wizard/data/voice-samples:/samples:ro \
   -v /home/wizard/data/negative-samples:/negative-samples:ro \
   -v /home/wizard/data/output:/output \
   -v /home/wizard/data/cache:/cache \
-  wakeword-5090 -c "嘿！赛赛猫！"
+  wakeword -c "嘿！赛赛猫！"
 
 # 也可显式指定自定义负样本目录（容器内路径）
 docker run --rm --gpus all \
@@ -120,34 +140,14 @@ docker run --rm --gpus all \
   -v /home/wizard/data/custom-neg:/my-negatives:ro \
   -v /home/wizard/data/output:/output \
   -v /home/wizard/data/cache:/cache \
-  wakeword-5090 -c "嘿！赛赛猫！" --negative-samples-dir /my-negatives
+  wakeword -c "嘿！赛赛猫！" \
+  --negative-samples-dir /my-negatives \
+  --hard-negative-penalty-weight 3.0 \
+  --hard-negative-sampling-weight 10.0
 
-# ============================================================
-# 自动化脚本示例
-# ============================================================
-
-#!/bin/bash
-# train_wakeword.sh - 同步运行，训练完成后继续执行
-
-WAKEWORD="嘿！赛赛猫！"
-SAMPLES_DIR="./samples"
-OUTPUT_DIR="./output"
-
-mkdir -p "$OUTPUT_DIR"
-
-docker run --rm --gpus all \
-  -e MICROWAKEWORD_TRAIN_BATCH=256 \
-  -v "$SAMPLES_DIR:/samples:ro" \
-  -v "$OUTPUT_DIR:/output" \
-  wakeword-5090 -c "$WAKEWORD"
-
-if [ $? -eq 0 ]; then
-  echo "训练成功！"
-  ls -la "$OUTPUT_DIR"/*.tflite
-else
-  echo "训练失败，退出码: $?"
-  exit 1
-fi
+# 训练完成后：
+#   - 容器自动退出
+#   - 模型保存在 /home/wizard/data/output/<slug>.tflite
 
 # ============================================================
 # 样本要求
@@ -162,24 +162,16 @@ fi
 # 参数说明
 # ============================================================
 #
-# -c, --wakeword        唤醒词文本（用于命名输出模型）
-# -s, --samples-dir     预生成语音样本的目录路径（可选，默认使用 /samples）
+# -c, --wakeword         唤醒词文本（用于命名输出模型）
+# -s, --samples-dir      预生成语音样本目录（默认使用 /samples）
 # --negative-samples-dir 自定义负样本目录（WAV，可选；会追加到默认负样本）
-# -o, --output-dir      输出目录路径（可选，默认使用 /output）
-# --training-steps      训练步数（默认 10000）
-# --max-samples         合成样本数量（仅当无预生成样本时使用，默认 400）
-
-# 环境变量（可选）
+# --hard-negative-penalty-weight  自定义硬负样本的惩罚权重（默认 3.0）
+# --hard-negative-sampling-weight 自定义硬负样本抽样权重（默认 10.0）
+# -o, --output-dir       输出目录（默认使用 /output）
+# --training-steps       训练步数（默认 10000）
+# --max-samples          合成样本数量（仅当无预生成样本时使用，默认 400）
+#
+# 环境变量（可选）：
 # MICROWAKEWORD_CUSTOM_NEGATIVE_DIR   自定义负样本目录（默认 /negative-samples）
-
-# ============================================================
-# 高级示例
-# ============================================================
-
-# 使用更多训练步数
-docker run --rm --gpus all \
-  -e MICROWAKEWORD_TRAIN_BATCH=256 \
-  -v /home/wizard/data/voice-samples:/samples:ro \
-  -v /home/wizard/data/output:/output \
-  -v /home/wizard/data/cache:/cache \
-  wakeword-5090 -c "嘿，赛赛猫！" --training-steps 15000
+# MICROWAKEWORD_HARD_NEG_PENALTY      自定义硬负样本的惩罚权重（默认 3.0）
+# MICROWAKEWORD_HARD_NEG_SAMPLING     自定义硬负样本抽样权重（默认 10.0）
