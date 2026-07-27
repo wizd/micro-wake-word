@@ -26,13 +26,6 @@ import tensorflow as tf
 from tensorflow.python.util import tf_decorator
 
 
-def _to_numpy(value):
-    """Convert a value to numpy array, handling both TF tensors and numpy arrays."""
-    if isinstance(value, np.ndarray):
-        return value
-    return value.numpy()
-
-
 @contextlib.contextmanager
 def swap_attribute(obj, attr, temp_value):
     """Temporarily swap an attribute of an object."""
@@ -77,7 +70,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
 
-    test_set_fp = _to_numpy(result["fp"])
+    test_set_fp = np.asarray(result["fp"])
 
     if data_processor.get_mode_size("validation_ambient") > 0:
         (
@@ -108,9 +101,9 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
         # Other than the false positive rate, all other metrics are accumulated across
         # both test sets
-        all_true_positives = _to_numpy(ambient_predictions["tp"])
-        ambient_false_positives = _to_numpy(ambient_predictions["fp"]) - test_set_fp
-        all_false_negatives = _to_numpy(ambient_predictions["fn"])
+        all_true_positives = np.asarray(ambient_predictions["tp"])
+        ambient_false_positives = np.asarray(ambient_predictions["fp"]) - test_set_fp
+        all_false_negatives = np.asarray(ambient_predictions["fn"])
 
         metrics["auc"] = ambient_predictions["auc"]
         metrics["loss"] = ambient_predictions["loss"]
@@ -158,7 +151,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
         # Use trapezoid rule to estimate the area under the curve, then divide by 2.0 to get the average recall
         average_viable_recall = (
-            np.trapz(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
+            np.trapezoid(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
         )
 
         metrics["recall_at_no_faph"] = recall_at_no_faph
