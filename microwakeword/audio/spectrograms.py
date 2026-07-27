@@ -56,8 +56,8 @@ class SpectrogramGeneration:
         if self.augmenter is not None:
             clip = self.augmenter.augment_clip(clip)
 
-        # Use TensorFlow backend instead of C++ pymicro-features for better compatibility
-        return generate_features_for_clip(clip, self.step_ms, use_c=False)
+        # Prefer C microfrontend (pymicro-features) to avoid initializing TF during feature gen.
+        return generate_features_for_clip(clip, self.step_ms, use_c=True)
 
     def spectrogram_generator(self, random=False, max_clips=None, **kwargs):
         """A Python generator that retrieves (augmented) spectrograms.
@@ -84,7 +84,7 @@ class SpectrogramGeneration:
 
         for augmented_clip in augmented_generator:
             # Use TensorFlow backend instead of C++ pymicro-features for better compatibility
-            spectrogram = generate_features_for_clip(augmented_clip, self.step_ms, use_c=False)
+            spectrogram = generate_features_for_clip(augmented_clip, self.step_ms, use_c=True)
 
             if self.split_spectrogram_duration_s is not None:
                 # Splits the resulting spectrogram into non-overlapping spectrograms. The features from the first 20 feature windows are dropped.

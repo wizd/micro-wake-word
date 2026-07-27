@@ -26,6 +26,9 @@ from typing import List
 from microwakeword.inference import Model
 from numpy.lib.stride_tricks import sliding_window_view
 
+# NumPy 2 renamed trapz -> trapezoid; keep TF 2.17 (numpy<2) compatible.
+_trapezoid = getattr(np, "trapezoid", np.trapz)
+
 
 def compute_metrics(true_positives, true_negatives, false_positives, false_negatives):
     """Utility function to compute various metrics.
@@ -388,7 +391,7 @@ def tflite_streaming_model_roc(
 
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        auc = np.trapezoid(y_coordinates, x_coordinates)
+        auc = _trapezoid(y_coordinates, x_coordinates)
         auc_string = "AUC {:.5f}".format(auc)
         logging.info(auc_string)
         fd.write(auc_string + "\n")

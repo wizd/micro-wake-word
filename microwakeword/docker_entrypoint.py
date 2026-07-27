@@ -1,104 +1,31 @@
-"""Container entrypoint for training microWakeWord models."""
+"""Container entrypoint for training microWakeWord models.
+
+Thin CLI wrapper around :mod:`microwakeword.pipeline`.
+"""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import itertools
 import logging
-import os
-import re
-import shutil
-import subprocess
 import sys
-import threading
 import time
-import wave
-import zipfile
-from datetime import timedelta
 from pathlib import Path
 
-import yaml
-
-from mmap_ninja.ragged import RaggedMmap  # type: ignore[import-not-found]
-from piper import PiperVoice  # type: ignore[import-not-found]
-
-# Import and verify soundfile is available before datasets tries to use it
-try:
-    import soundfile as sf
-    logging.info(f"soundfile {sf.__version__} loaded successfully")
-except ImportError as e:
-    logging.error(f"Failed to import soundfile: {e}")
-    raise
-
-from microwakeword.audio.augmentation import Augmentation
-from microwakeword.audio.clips import Clips
-from microwakeword.audio.spectrograms import SpectrogramGeneration
-
-NEGATIVE_DATASET_ROOT = (
-    "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/"
+from microwakeword.pipeline import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CUSTOM_NEGATIVE_DIR,
+    DEFAULT_HARD_NEG_PENALTY,
+    DEFAULT_HARD_NEG_SAMPLING,
+    DEFAULT_NEGATIVE_DIR,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_SAMPLE_COUNT,
+    DEFAULT_SAMPLES_DIR,
+    DEFAULT_TRAINING_STEPS,
+    TrainingRequest,
+    run_pipeline,
+    slugify_phrase,
 )
-NEGATIVE_DATASETS = {
-    "dinner_party.zip": "dinner_party",
-    "dinner_party_eval.zip": "dinner_party_eval",
-    "no_speech.zip": "no_speech",
-    "speech.zip": "speech",
-}
-DEFAULT_SAMPLE_COUNT = int(os.getenv("MICROWAKEWORD_SAMPLE_COUNT", "400"))
-DEFAULT_BATCH_SIZE = int(os.getenv("MICROWAKEWORD_SAMPLE_BATCH", "50"))
-DEFAULT_TRAINING_STEPS = int(os.getenv("MICROWAKEWORD_TRAINING_STEPS", "10000"))
-# Allow overriding the training batch size to avoid OOMs on low-memory machines.
-# Default is 256 for systems with adequate RAM. Set MICROWAKEWORD_TRAIN_BATCH
-# when running the container to control this without changing code.
-DEFAULT_TRAIN_BATCH = int(os.getenv("MICROWAKEWORD_TRAIN_BATCH", "256"))
-DEFAULT_HARD_NEG_PENALTY = float(os.getenv("MICROWAKEWORD_HARD_NEG_PENALTY", "3.0"))
-DEFAULT_HARD_NEG_SAMPLING = float(os.getenv("MICROWAKEWORD_HARD_NEG_SAMPLING", "10.0"))
-
-# Directory configuration for separating fixed assets from dynamic workspace
-# Fixed assets (built into the image):
-#   - Piper TTS voice model
-#   - Negative datasets (pre-downloaded)
-# Dynamic workspace (mounted volumes):
-#   - Input samples
-#   - Output models
-#   - Training cache
-DEFAULT_SAMPLES_DIR = Path(os.getenv("MICROWAKEWORD_SAMPLES_DIR", "/samples"))
-DEFAULT_OUTPUT_DIR = Path(os.getenv("MICROWAKEWORD_OUTPUT_DIR", "/output"))
-DEFAULT_CACHE_DIR = Path(os.getenv("MICROWAKEWORD_CACHE_DIR", "/cache"))
-DEFAULT_NEGATIVE_DIR = Path(os.getenv("MICROWAKEWORD_NEGATIVE_DATASETS_DIR", "/opt/negative-datasets"))
-DEFAULT_CUSTOM_NEGATIVE_DIR = Path(
-    os.getenv("MICROWAKEWORD_CUSTOM_NEGATIVE_DIR", "/negative-samples")
-)
-
-DEFAULT_VOICE_MODEL = Path(
-    os.getenv("MICROWAKEWORD_VOICE_MODEL", "/opt/piper-voices/zh_CN-huayan-medium.onnx")
-)
-DEFAULT_VOICE_CONFIG = Path(
-    os.getenv("MICROWAKEWORD_VOICE_CONFIG", "/opt/piper-voices/zh_CN-huayan-medium.onnx.json")
-)
-DEFAULT_VOICE_URL = os.getenv(
-    "MICROWAKEWORD_VOICE_URL",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/zh_CN-huayan-medium.onnx?download=true",
-)
-DEFAULT_VOICE_CONFIG_URL = os.getenv(
-    "MICROWAKEWORD_VOICE_CONFIG_URL",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/zh_CN-huayan-medium.onnx.json?download=true",
-)
-
-def should_use_cuda() -> bool:
-    """Decide whether to use CUDA based on env and availability."""
-    flag = os.getenv("MICROWAKEWORD_USE_CUDA", "auto").lower()
-    if flag in ("0", "false", "cpu", "no"):
-        return False
-    if flag in ("1", "true", "yes", "gpu", "cuda"):
-        return True
-    if flag == "auto":
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except Exception:
-            return False
-    return False
 
 
 class UTCFormatter(logging.Formatter):
@@ -120,423 +47,6 @@ def configure_logging() -> None:
     root.addHandler(handler)
 
 
-def slugify_phrase(wakeword: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", wakeword.lower()).strip("_")
-    return slug or "wakeword"
-
-
-def ensure_voice_assets() -> tuple[Path, Path]:
-    model_path = DEFAULT_VOICE_MODEL
-    config_path = DEFAULT_VOICE_CONFIG
-
-    if not model_path.exists():
-        logging.info("downloading piper voice model from %s", DEFAULT_VOICE_URL)
-        download_file(DEFAULT_VOICE_URL, model_path)
-
-    if not config_path.exists():
-        logging.info("downloading piper voice config from %s", DEFAULT_VOICE_CONFIG_URL)
-        download_file(DEFAULT_VOICE_CONFIG_URL, config_path)
-
-    return model_path, config_path
-
-
-def load_voice() -> PiperVoice:
-    model_path, config_path = ensure_voice_assets()
-    use_cuda = should_use_cuda()
-    logging.info("loading Piper voice from %s", model_path)
-    return PiperVoice.load(str(model_path), config_path=str(config_path), use_cuda=use_cuda)
-
-
-def synthesize_wakeword_samples(
-    *, voice: PiperVoice, wakeword: str, samples_dir: Path, max_samples: int
-) -> None:
-    logging.info(
-        "generating %d synthetic samples for '%s' using Piper voice", max_samples, wakeword
-    )
-
-    length_scales = [0.85, 0.95, 1.0, 1.1, 1.2]
-    noise_scales = [0.55, 0.65, 0.75]
-    noise_ws = [0.7, 0.8, 0.9]
-    phrases = [wakeword, f"{wakeword}.", f"{wakeword}!", wakeword.title()]
-
-    variation_iter = itertools.cycle(
-        itertools.product(length_scales, noise_scales, noise_ws)
-    )
-    phrase_iter = itertools.cycle(phrases)
-
-    for index in range(max_samples):
-        length_scale, noise_scale, noise_w = next(variation_iter)
-        phrase = next(phrase_iter)
-        output_path = samples_dir / f"{index}.wav"
-
-        with wave.open(str(output_path), "wb") as wav_file:
-            voice.synthesize(
-                phrase,
-                wav_file,
-                length_scale=length_scale,
-                noise_scale=noise_scale,
-                noise_w=noise_w,
-            )
-
-
-def ensure_wakeword_samples(
-    *, wakeword: str, samples_dir: Path, max_samples: int, batch_size: int
-) -> None:
-    _ = batch_size  # retained for CLI compatibility
-
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    if list(samples_dir.rglob("*.wav")):
-        logging.info("wake word samples already exist; skipping synthesis")
-        return
-
-    voice = load_voice()
-    synthesize_wakeword_samples(
-        voice=voice,
-        wakeword=wakeword,
-        samples_dir=samples_dir,
-        max_samples=max_samples,
-    )
-
-
-def download_file(url: str, destination: Path) -> None:
-    import urllib.request
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(urllib.request.urlopen(url)) as response, destination.open(
-        "wb"
-    ) as output:
-        shutil.copyfileobj(response, output)
-
-
-def ensure_negative_datasets(base_dir: Path) -> None:
-    base_dir.mkdir(parents=True, exist_ok=True)
-    for archive, folder in NEGATIVE_DATASETS.items():
-        target_dir = base_dir / folder
-        # Check if the training subdirectory exists and contains mmap data.
-        # The zip files extract to: {folder}/training/*_mmap/ structure.
-        training_dir = target_dir / "training"
-        if training_dir.exists() and any(training_dir.iterdir()):
-            logging.info("negative dataset '%s' already present", folder)
-            continue
-
-        url = NEGATIVE_DATASET_ROOT + archive
-        archive_path = base_dir / archive
-        if not archive_path.exists():
-            logging.info("downloading negative dataset '%s' (this may take a while)", folder)
-            download_file(url, archive_path)
-        logging.info("extracting negative dataset '%s' (this may take a while)", folder)
-        with zipfile.ZipFile(archive_path, "r") as zip_file:
-            zip_file.extractall(base_dir)
-        logging.info("completed extraction of '%s'", folder)
-
-
-def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> None:
-    features_dir.mkdir(parents=True, exist_ok=True)
-    clips = Clips(
-        input_directory=str(samples_dir),
-        file_pattern="**/*.wav",
-        remove_silence=False,
-        random_split_seed=10,
-        split_count=0.1,
-    )
-
-    augmenter = Augmentation(
-        augmentation_duration_s=3.2,
-        augmentation_probabilities={
-            "SevenBandParametricEQ": 0.05,
-            "TanhDistortion": 0.05,
-            "PitchShift": 0.05,
-            "BandStopFilter": 0.05,
-            "AddColorNoise": 0.05,
-            "AddBackgroundNoise": 0.0,
-            "Gain": 1.0,
-            "RIR": 0.0,
-        },
-        impulse_paths=[],
-        background_paths=[],
-        background_min_snr_db=-5,
-        background_max_snr_db=10,
-        min_jitter_s=0.195,
-        max_jitter_s=0.205,
-    )
-
-    for split in ("training", "validation", "testing"):
-        split_dir = features_dir / split
-        mmap_dir = split_dir / "wakeword_mmap"
-        manifest = mmap_dir / "manifest.json"
-        if manifest.exists():
-            logging.info("positive features for %s already exist", split)
-            continue
-
-        split_dir.mkdir(parents=True, exist_ok=True)
-
-        if split == "training":
-            split_name = "train"
-            repetition = 2
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
-            )
-        elif split == "validation":
-            split_name = "validation"
-            repetition = 1
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
-            )
-        else:
-            split_name = "test"
-            repetition = 1
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=1, step_ms=10
-            )
-
-        logging.info("creating positive feature set for %s", split)
-        RaggedMmap.from_generator(
-            out_dir=str(mmap_dir),
-            sample_generator=spectrograms.spectrogram_generator(
-                split=split_name, repeat=repetition
-            ),
-            batch_size=100,
-            verbose=True,
-        )
-
-
-def generate_custom_negative_feature_sets(samples_dir: Path, features_dir: Path) -> None:
-    features_dir.mkdir(parents=True, exist_ok=True)
-    clips = Clips(
-        input_directory=str(samples_dir),
-        file_pattern="**/*.wav",
-        remove_silence=False,
-        random_split_seed=10,
-        split_count=0.1,
-    )
-
-    augmenter = Augmentation(
-        augmentation_duration_s=3.2,
-        augmentation_probabilities={
-            "SevenBandParametricEQ": 0.05,
-            "TanhDistortion": 0.05,
-            "PitchShift": 0.05,
-            "BandStopFilter": 0.05,
-            "AddColorNoise": 0.05,
-            "AddBackgroundNoise": 0.0,
-            "Gain": 1.0,
-            "RIR": 0.0,
-        },
-        impulse_paths=[],
-        background_paths=[],
-        background_min_snr_db=-5,
-        background_max_snr_db=10,
-        min_jitter_s=0.195,
-        max_jitter_s=0.205,
-    )
-
-    for split in ("training", "validation", "testing"):
-        split_dir = features_dir / split
-        mmap_dir = split_dir / "custom_negative_mmap"
-        manifest = mmap_dir / "manifest.json"
-        if manifest.exists():
-            logging.info("custom negative features for %s already exist", split)
-            continue
-
-        split_dir.mkdir(parents=True, exist_ok=True)
-
-        if split == "training":
-            split_name = "train"
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
-            )
-        elif split == "validation":
-            split_name = "validation"
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
-            )
-        else:
-            split_name = "test"
-            spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=1, step_ms=10
-            )
-
-        logging.info("creating custom negative feature set for %s", split)
-        RaggedMmap.from_generator(
-            out_dir=str(mmap_dir),
-            sample_generator=spectrograms.spectrogram_generator(split=split_name),
-            batch_size=100,
-            verbose=True,
-        )
-
-
-def write_training_config(
-    *,
-    session_dir: Path,
-    slug: str,
-    training_steps: int,
-    negatives_dir: Path,
-    custom_negative_features_dir: Path | None = None,
-    hard_negative_penalty_weight: float = DEFAULT_HARD_NEG_PENALTY,
-    hard_negative_sampling_weight: float = DEFAULT_HARD_NEG_SAMPLING,
-) -> tuple[Path, Path]:
-    train_dir = Path("trained_models") / slug
-
-    # Use absolute path for negative datasets if they're outside session_dir
-    negatives_path = str(negatives_dir)
-
-    config = {
-        "window_step_ms": 10,
-        "train_dir": str(train_dir),
-        "features": [
-            {
-                "features_dir": "generated_augmented_features",
-                "sampling_weight": 2.0,
-                "penalty_weight": 1.0,
-                "truth": True,
-                "truncation_strategy": "truncate_start",
-                "type": "mmap",
-            },
-            {
-                "features_dir": f"{negatives_path}/speech",
-                "sampling_weight": 10.0,
-                "penalty_weight": 1.0,
-                "truth": False,
-                "truncation_strategy": "random",
-                "type": "mmap",
-            },
-            {
-                "features_dir": f"{negatives_path}/dinner_party",
-                "sampling_weight": 10.0,
-                "penalty_weight": 1.0,
-                "truth": False,
-                "truncation_strategy": "random",
-                "type": "mmap",
-            },
-            {
-                "features_dir": f"{negatives_path}/no_speech",
-                "sampling_weight": 5.0,
-                "penalty_weight": 1.0,
-                "truth": False,
-                "truncation_strategy": "random",
-                "type": "mmap",
-            },
-            {
-                "features_dir": f"{negatives_path}/dinner_party_eval",
-                "sampling_weight": 0.0,
-                "penalty_weight": 1.0,
-                "truth": False,
-                "truncation_strategy": "split",
-                "type": "mmap",
-            },
-        ],
-        "training_steps": [training_steps],
-        "positive_class_weight": [1],
-        "negative_class_weight": [20],
-        "learning_rates": [0.001],
-        # Batch size for training; reduce to lower memory usage on constrained hosts.
-        "batch_size": DEFAULT_TRAIN_BATCH,
-        "time_mask_max_size": [0],
-        "time_mask_count": [0],
-        "freq_mask_max_size": [0],
-        "freq_mask_count": [0],
-        "eval_step_interval": 500,
-        "clip_duration_ms": 1500,
-        "target_minimization": 0.9,
-        "minimization_metric": None,
-        "maximization_metric": "average_viable_recall",
-    }
-
-    if custom_negative_features_dir:
-        config["features"].append(
-            {
-                "features_dir": str(custom_negative_features_dir),
-                "sampling_weight": hard_negative_sampling_weight,
-                "penalty_weight": hard_negative_penalty_weight,
-                "truth": False,
-                "truncation_strategy": "random",
-                "type": "mmap",
-            }
-        )
-
-    config_path = session_dir / "training_parameters.yaml"
-    with config_path.open("w", encoding="utf-8") as file:
-        yaml.safe_dump(config, file, sort_keys=False)
-
-    return config_path, session_dir / train_dir
-
-
-def run_training_process(config_path: Path, *, workdir: Path) -> None:
-    env = os.environ.copy()
-    if should_use_cuda():
-        env.pop("CUDA_VISIBLE_DEVICES", None)
-    else:
-        env.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
-
-    command = [
-        sys.executable,
-        "-m",
-        "microwakeword.model_train_eval",
-        f"--training_config={config_path.name}",
-        "--train",
-        "1",
-        "--restore_checkpoint",
-        "1",
-        "--test_tf_nonstreaming",
-        "0",
-        "--test_tflite_nonstreaming",
-        "0",
-        "--test_tflite_nonstreaming_quantized",
-        "0",
-        "--test_tflite_streaming",
-        "0",
-        "--test_tflite_streaming_quantized",
-        "1",
-        "--use_weights",
-        "best_weights",
-        "mixednet",
-        "--pointwise_filters",
-        "64,64,64,64",
-        "--repeat_in_block",
-        "1,1,1,1",
-        "--mixconv_kernel_sizes",
-        "[5],[7,11],[9,15],[23]",
-        "--residual_connection",
-        "0,0,0,0",
-        "--first_conv_filters",
-        "32",
-        "--first_conv_kernel_size",
-        "5",
-        "--stride",
-        "3",
-    ]
-
-    logging.info("launching training process")
-    subprocess.run(command, cwd=workdir, check=True, env=env)
-
-
-def locate_tflite_model(train_dir: Path) -> Path:
-    candidate = (
-        train_dir
-        / "tflite_stream_state_internal_quant"
-        / "stream_state_internal_quant.tflite"
-    )
-    if not candidate.exists():
-        raise FileNotFoundError(
-            f"Expected quantized streaming model at {candidate}, but it was not created."
-        )
-    return candidate
-
-
-def start_progress_logger(stop_event: threading.Event) -> threading.Thread:
-    def _log_status() -> None:
-        if stop_event.wait(60):
-            return
-        logging.info("still training...")
-        while not stop_event.wait(300):
-            logging.info("still training...")
-
-    thread = threading.Thread(target=_log_status, name="progress-logger", daemon=True)
-    thread.start()
-    return thread
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a wake word model inside Docker")
     parser.add_argument(
@@ -551,7 +61,7 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to directory containing pre-generated WAV samples (16kHz, mono, 16-bit). "
-             "If not provided, uses MICROWAKEWORD_SAMPLES_DIR or generates samples using Piper TTS.",
+        "If not provided, uses MICROWAKEWORD_SAMPLES_DIR or generates samples using Piper TTS.",
     )
     parser.add_argument(
         "-o",
@@ -559,7 +69,7 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to output directory for the trained model. "
-             "Defaults to MICROWAKEWORD_OUTPUT_DIR env var or /output.",
+        "Defaults to MICROWAKEWORD_OUTPUT_DIR env var or /output.",
     )
     parser.add_argument(
         "--max-samples",
@@ -584,7 +94,7 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to directory containing custom negative WAV samples (16kHz, mono, 16-bit). "
-             "These will be added alongside the default negative datasets.",
+        "These will be added alongside the default negative datasets.",
     )
     parser.add_argument(
         "--hard-negative-penalty-weight",
@@ -609,131 +119,41 @@ def main() -> None:
     if not wakeword:
         parser.error("Wake word must not be empty")
 
-    slug = slugify_phrase(wakeword)
-
-    # Resolve directory paths from args or environment variables
     output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
-    cache_dir = DEFAULT_CACHE_DIR
-    negatives_dir = DEFAULT_NEGATIVE_DIR
-    custom_negative_dir = None
+    samples_dir = Path(args.samples_dir) if args.samples_dir else None
+    custom_negative_dir = (
+        Path(args.negative_samples_dir) if args.negative_samples_dir else None
+    )
 
-    # Session directory for training artifacts (in cache)
-    session_dir = cache_dir / slug
-    features_dir = session_dir / "generated_augmented_features"
-
-    # Determine samples directory priority:
-    # 1. Command line --samples-dir
-    # 2. Environment MICROWAKEWORD_SAMPLES_DIR (if it contains wav files)
-    # 3. Generate using Piper TTS
-    if args.samples_dir:
-        samples_dir = Path(args.samples_dir)
-        if not samples_dir.exists():
-            parser.error(f"Samples directory does not exist: {samples_dir}")
-        wav_files = list(samples_dir.rglob("*.wav"))
-        if not wav_files:
-            parser.error(f"No WAV files found in samples directory: {samples_dir}")
-        logging.info(
-            "using %d pre-generated samples from '%s' (skipping Piper TTS)",
-            len(wav_files),
-            samples_dir,
-        )
-        use_external_samples = True
-    elif DEFAULT_SAMPLES_DIR.exists() and list(DEFAULT_SAMPLES_DIR.rglob("*.wav")):
+    # Fall back to default mount points if they contain WAV files
+    if samples_dir is None and DEFAULT_SAMPLES_DIR.exists() and list(
+        DEFAULT_SAMPLES_DIR.rglob("*.wav")
+    ):
         samples_dir = DEFAULT_SAMPLES_DIR
-        wav_files = list(samples_dir.rglob("*.wav"))
-        logging.info(
-            "using %d pre-generated samples from '%s' (skipping Piper TTS)",
-            len(wav_files),
-            samples_dir,
-        )
-        use_external_samples = True
-    else:
-        samples_dir = session_dir / "generated_samples"
-        use_external_samples = False
 
-    if args.negative_samples_dir:
-        custom_negative_dir = Path(args.negative_samples_dir)
-        if not custom_negative_dir.exists():
-            parser.error(f"Negative samples directory does not exist: {custom_negative_dir}")
-        if not list(custom_negative_dir.rglob("*.wav")):
-            parser.error(
-                "No WAV files found in negative samples directory: "
-                f"{custom_negative_dir}"
-            )
-        logging.info(
-            "using custom negative samples from '%s'",
-            custom_negative_dir,
-        )
-    elif DEFAULT_CUSTOM_NEGATIVE_DIR.exists() and list(
+    if custom_negative_dir is None and DEFAULT_CUSTOM_NEGATIVE_DIR.exists() and list(
         DEFAULT_CUSTOM_NEGATIVE_DIR.rglob("*.wav")
     ):
         custom_negative_dir = DEFAULT_CUSTOM_NEGATIVE_DIR
-        logging.info(
-            "using custom negative samples from '%s'",
-            custom_negative_dir,
-        )
 
-    # Ensure directories exist
-    session_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    slug = slugify_phrase(wakeword)
+    req = TrainingRequest(
+        wakeword=wakeword,
+        job_id=slug,
+        samples_dir=samples_dir,
+        output_dir=output_dir,
+        cache_dir=DEFAULT_CACHE_DIR,
+        negatives_dir=DEFAULT_NEGATIVE_DIR,
+        custom_negative_dir=custom_negative_dir,
+        max_samples=args.max_samples,
+        sample_batch_size=args.sample_batch_size,
+        training_steps=args.training_steps,
+        hard_negative_penalty_weight=args.hard_negative_penalty_weight,
+        hard_negative_sampling_weight=args.hard_negative_sampling_weight,
+    )
 
     try:
-        # Generate samples if needed
-        if not use_external_samples:
-            ensure_wakeword_samples(
-                wakeword=wakeword,
-                samples_dir=samples_dir,
-                max_samples=args.max_samples,
-                batch_size=args.sample_batch_size,
-            )
-
-        # Ensure negative datasets are available (download if not present)
-        ensure_negative_datasets(negatives_dir)
-
-        # Generate feature sets for training
-        generate_positive_feature_sets(samples_dir, features_dir)
-        custom_negative_features_dir = None
-        if custom_negative_dir:
-            custom_negative_features_dir = session_dir / "custom_negative_features"
-            generate_custom_negative_feature_sets(
-                custom_negative_dir, custom_negative_features_dir
-            )
-
-        # Write training configuration
-        config_path, train_dir = write_training_config(
-            session_dir=session_dir,
-            slug=slug,
-            training_steps=args.training_steps,
-            negatives_dir=negatives_dir,
-            custom_negative_features_dir=custom_negative_features_dir,
-            hard_negative_penalty_weight=args.hard_negative_penalty_weight,
-            hard_negative_sampling_weight=args.hard_negative_sampling_weight,
-        )
-
-        logging.info("starting training for '%s' - this will take a while", wakeword)
-        start_time = time.time()
-        stop_event = threading.Event()
-        progress_thread = start_progress_logger(stop_event)
-
-        try:
-            run_training_process(config_path, workdir=session_dir)
-        finally:
-            stop_event.set()
-            progress_thread.join(timeout=1)
-
-        # Copy trained model to output directory
-        model_path = locate_tflite_model(train_dir)
-        output_model = output_dir / f"{slug}.tflite"
-        shutil.copy2(model_path, output_model)
-
-        duration = timedelta(seconds=int(time.time() - start_time))
-        logging.info(
-            "training complete for '%s'; model saved to %s (took %s)",
-            wakeword,
-            output_model,
-            duration,
-        )
-
+        run_pipeline(req)
     except Exception as exc:  # pragma: no cover - to aid manual diagnosis
         logging.exception("failed to train wake word model: %s", exc)
         raise SystemExit(1) from exc

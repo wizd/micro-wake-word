@@ -90,6 +90,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip && \
         'git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f' \
         'datasets[audio]' \
         torchcodec \
+        pypinyin \
         audiomentations \
         mmap_ninja \
         pymicro-features \
