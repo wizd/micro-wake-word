@@ -19,6 +19,10 @@ microWakeWord is an open-source wakeword library for detecting custom wake words
 
 **microWakeword is currently available as an early release. Training new models is intended for advanced users. Training a model that works well is still very difficult, as it typically requires experimentation with hyperparameters and sample generation settings. Please share any insights you find for training a good model!**
 
+### HTTP customization service
+
+For integrating the serial wake-word training API with other systems (jobs, webhooks, model download), see [documentation/integration_guide.md](documentation/integration_guide.md).
+
 ## Detection Process
 
 We detect the wake word in two stages. Raw audio data is processed into 40 spectrogram features every 10 ms. The streaming inference model uses the newest slice of feature data as input and returns a probability that the wake word is said. If the model consistently predicts the wake word over multiple windows, then we predict that the wake word has been said.
