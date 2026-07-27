@@ -1,3 +1,19 @@
+# RTX 4090D 默认 Dockerfile（兼兼容 2080/30/40 系列）
+# GPU: CUDA 12.3 + PyTorch cu124 + TensorFlow 2.17
+# CPU: 可通过 --build-arg DEVICE=cpu 构建
+#
+# 5090 请使用 Dockerfile.5090（专用编译的 TF，支持 sm_120）
+#
+# 目录配置：分离固定资源与动态工作区
+# 固定资源（镜像内置）：
+#   - /opt/piper-voices: Piper TTS 模型
+#   - /opt/negative-datasets: 负样本数据集
+# 动态工作区（挂载卷）：
+#   - /samples: 输入语音样本
+#   - /output: 输出 tflite 模型
+#   - /cache: 训练中间文件缓存
+#   - /negative-samples: 自定义负样本（可选）
+
 ARG DEVICE=gpu
 
 FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04 AS base-gpu
@@ -11,12 +27,16 @@ ARG DEVICE
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
+    LC_ALL=C.UTF-8
+
+# Piper TTS 语音模型配置
+ENV MICROWAKEWORD_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx?download=true" \
     MICROWAKEWORD_VOICE_CONFIG_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json?download=true" \
     MICROWAKEWORD_VOICE_MODEL=/opt/piper-voices/zh_CN-huayan-medium.onnx \
-    MICROWAKEWORD_VOICE_CONFIG=/opt/piper-voices/zh_CN-huayan-medium.onnx.json \
-    MICROWAKEWORD_SAMPLES_DIR=/samples \
+    MICROWAKEWORD_VOICE_CONFIG=/opt/piper-voices/zh_CN-huayan-medium.onnx.json
+
+# 目录配置
+ENV MICROWAKEWORD_SAMPLES_DIR=/samples \
     MICROWAKEWORD_OUTPUT_DIR=/output \
     MICROWAKEWORD_CACHE_DIR=/cache \
     MICROWAKEWORD_NEGATIVE_DATASETS_DIR=/opt/negative-datasets
@@ -44,6 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY . /app
 
+# 安装依赖：先固定 GPU/CPU 栈，再装项目其余依赖
+# --no-deps 安装项目本身，避免 setup.py 的 tensorflow>=2.18 覆盖 4090D 固定的 2.17
 RUN python -m pip install --no-cache-dir --upgrade pip && \
     if [ "$DEVICE" = "gpu" ]; then \
         python -m pip install --no-cache-dir \
@@ -67,12 +89,25 @@ RUN python -m pip install --no-cache-dir --upgrade pip && \
         'piper-tts>=1.3.0' \
         'git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f' \
         'datasets[audio]' \
-        torchcodec && \
-    python -m pip install --no-cache-dir -e .
+        torchcodec \
+        audiomentations \
+        mmap_ninja \
+        pymicro-features \
+        pyyaml \
+        webrtcvad-wheels \
+        ai-edge-litert && \
+    python -m pip install --no-cache-dir --no-deps -e .
 
-RUN mkdir -p /samples /output /cache /opt/piper-voices /opt/negative-datasets && \
+# 创建挂载点目录
+RUN mkdir -p /samples /output /cache
+
+# 下载固定资源：Piper TTS 语音模型
+RUN mkdir -p /opt/piper-voices && \
     wget -q -O /opt/piper-voices/zh_CN-huayan-medium.onnx "${MICROWAKEWORD_VOICE_URL}" && \
-    wget -q -O /opt/piper-voices/zh_CN-huayan-medium.onnx.json "${MICROWAKEWORD_VOICE_CONFIG_URL}" && \
+    wget -q -O /opt/piper-voices/zh_CN-huayan-medium.onnx.json "${MICROWAKEWORD_VOICE_CONFIG_URL}"
+
+# 下载固定资源：负样本数据集（约 2GB，加速首次运行）
+RUN mkdir -p /opt/negative-datasets && \
     cd /opt/negative-datasets && \
     wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/dinner_party.zip" && \
     wget -q "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main/dinner_party_eval.zip" && \

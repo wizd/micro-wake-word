@@ -51,7 +51,7 @@ WORKDIR /app
 
 COPY . /app
 
-# 安装依赖（TensorFlow 已在基础镜像中）
+# 安装依赖（TensorFlow 已在基础镜像中，勿被 setup.py 的 tensorflow>=2.18 覆盖）
 # 注意：基础镜像使用 Python 3.12，使用 piper-tts 1.3.0（支持 Python 3.12）
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
@@ -61,8 +61,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
         'piper-tts>=1.3.0' \
         'git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f' \
         'datasets[audio]' \
-        torchcodec && \
-    pip install --no-cache-dir -e .
+        torchcodec \
+        audiomentations \
+        mmap_ninja \
+        pymicro-features \
+        pyyaml \
+        webrtcvad-wheels \
+        ai-edge-litert && \
+    pip install --no-cache-dir --no-deps -e .
 
 # 创建挂载点目录
 RUN mkdir -p /samples /output /cache

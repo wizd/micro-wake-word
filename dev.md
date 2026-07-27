@@ -82,10 +82,13 @@ pip install -e .
 #   /output   - 输出：训练好的 tflite 模型
 #   /cache    - 缓存：训练中间文件（可选，加速重复训练）
 
-# 1. 构建 GPU 镜像（默认；支持 RTX 2080/30/40 系列）
+# 1. 构建 GPU 镜像（默认 Dockerfile = 4090D；兼容 2080/30/40 系列）
 docker build -t wakeword .
 # 或显式指定
 docker build --build-arg DEVICE=gpu -t wakeword .
+
+# 1b. 构建 5090 专用镜像（需 Dockerfile.5090）
+docker build -f Dockerfile.5090 -t wakeword-5090 .
 
 # 2. 构建 CPU-only 镜像
 docker build --build-arg DEVICE=cpu -t wakeword-cpu .
