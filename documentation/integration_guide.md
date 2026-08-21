@@ -2,7 +2,13 @@
 
 面向业务系统接入的 HTTP API 说明。服务串行（FIFO）训练自定义唤醒词，产出量化后的 `.tflite` 模型。
 
-默认监听 `0.0.0.0:6006`。OpenAPI 可在运行实例的 `/docs`、`/openapi.json` 查看。
+进程监听 `0.0.0.0:6006`。业务侧经 Tailscale 访问（需在同一 tailnet）：
+
+| 项 | 值 |
+|----|----|
+| Base URL | `http://mww-autodl.bunny-grouse.ts.net:6006` |
+| Tailscale IPv4 | `100.120.96.27` |
+| OpenAPI | `{BASE}/docs`、`{BASE}/openapi.json` |
 
 ---
 
@@ -39,7 +45,7 @@ sequenceDiagram
 ## 2. 快速开始
 
 ```bash
-BASE=http://127.0.0.1:6006
+BASE=http://mww-autodl.bunny-grouse.ts.net:6006
 # 若服务配置了 MWW_API_KEY，则所有 /api/v1/* 需带此头：
 # HDR=(-H "X-API-Key: $MWW_API_KEY")
 
@@ -258,7 +264,7 @@ def verify_mww_signature(body: bytes, secret: str, signature_header: str) -> boo
 1. **优先 Webhook + 兜底轮询**：回调失败时服务只重试有限次数，业务侧应对 `job_id` 做超时轮询（建议间隔 10–30s）。
 2. **串行队列**：`queue_length` / `queue_position` 反映积压；高峰请限流或向用户展示预计等待。
 3. **`metadata`**：放入订单号、用户 ID 等，Webhook 原样回传，避免自建 job_id 映射表时丢关联。
-4. **`model_url`**：响应里是相对路径；完整地址为 `{BASE}{model_url}`，例如 `https://mww.example.com/api/v1/jobs/xxx/model`。
+4. **`model_url`**：响应里是相对路径；完整地址为 `{BASE}{model_url}`，例如 `http://mww-autodl.bunny-grouse.ts.net:6006/api/v1/jobs/xxx/model`。
 5. **超时与取消**：端到端默认配置常见约十余分钟（视 GPU）；超时后对仍 `queued`/`running` 的任务发 `DELETE`，并处理最终 `cancelled`/`failed`。
 6. **探活**：负载均衡 / K8s 用 `GET /healthz`；不要把「排队非空」当成不健康。
 7. **安全**：公网务必设置 `MWW_API_KEY` 与 `MWW_WEBHOOK_SECRET`；Webhook URL 使用 HTTPS。
@@ -270,7 +276,7 @@ def verify_mww_signature(body: bytes, secret: str, signature_header: str) -> boo
 ### 8.1 完整 curl（含可选 Webhook）
 
 ```bash
-BASE=http://127.0.0.1:6006
+BASE=http://mww-autodl.bunny-grouse.ts.net:6006
 API_KEY="${MWW_API_KEY:-}"
 AUTH=()
 [[ -n "$API_KEY" ]] && AUTH=(-H "X-API-Key: $API_KEY")
@@ -293,7 +299,7 @@ curl -sS -X POST "$BASE/api/v1/jobs" \
 import time
 import requests
 
-BASE = "http://127.0.0.1:6006"
+BASE = "http://mww-autodl.bunny-grouse.ts.net:6006"
 HEADERS = {"X-API-Key": "your-secret"}  # 未启用鉴权时可省略
 
 r = requests.post(
@@ -322,7 +328,7 @@ open(f"{job['slug']}.tflite", "wb").write(model.content)
 ### 8.3 Node.js（创建 + 轮询）
 
 ```javascript
-const BASE = "http://127.0.0.1:6006";
+const BASE = "http://mww-autodl.bunny-grouse.ts.net:6006";
 const headers = { "Content-Type": "application/json", "X-API-Key": "your-secret" };
 
 async function train(wakeword) {
