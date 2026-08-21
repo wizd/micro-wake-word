@@ -15,49 +15,180 @@
 # limitations under the License.
 
 import os
-import platform
-import contextlib
 
 from absl import logging
 
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.python.util import tf_decorator
-
 # NumPy 2 renamed trapz -> trapezoid; keep TF 2.17 (numpy<2) compatible.
 _trapezoid = getattr(np, "trapezoid", np.trapz)
 
+_EVAL_BATCH_SIZE = 4096
+_PROGRESS_INTERVAL = 50
 
-@contextlib.contextmanager
-def swap_attribute(obj, attr, temp_value):
-    """Temporarily swap an attribute of an object."""
-    original_value = getattr(obj, attr)
-    setattr(obj, attr, temp_value)
 
+def _metric_numpy(metric):
+    value = metric.result()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def _metric_float(metric):
+    return float(_metric_numpy(metric))
+
+
+def _is_tensor(value):
+    return tf.is_tensor(value)
+
+
+def _consume_shuffle_rng(count):
+    """Consume the same numpy shuffle stream get_data() would use."""
+    if count <= 0:
+        return
+    indices = np.arange(count)
+    np.random.shuffle(indices)
+
+
+def _try_place_on_gpu(features, labels, name):
+    nbytes = features.nbytes if hasattr(features, "nbytes") else 0
     try:
-        yield
-    finally:
-        setattr(obj, attr, original_value)
+        with tf.device("/GPU:0"):
+            gpu_features = tf.constant(features)
+            gpu_labels = tf.constant(labels)
+        # Touch the tensor so the copy is realized before we drop the numpy source.
+        _ = gpu_features[:1]
+        logging.info(
+            "Cached %s on GPU: shape=%s (%.2f GiB)",
+            name,
+            tuple(gpu_features.shape),
+            nbytes / (1024**3),
+        )
+        return gpu_features, gpu_labels
+    except Exception as exc:
+        logging.warning(
+            "Keeping %s on host (%.2f GiB): %s",
+            name,
+            nbytes / (1024**3),
+            exc,
+        )
+        return features, labels
 
 
-def validate_nonstreaming(config, data_processor, model, test_set):
-    testing_fingerprints, testing_ground_truth, _ = data_processor.get_data(
-        test_set,
+def prepare_eval_cache(config, data_processor):
+    """Load validation splits once (no extra numpy shuffle)."""
+    val_x, val_y, _ = data_processor.get_data(
+        "validation",
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
         truncation_strategy="truncate_start",
+        shuffle=False,
     )
-    testing_ground_truth = testing_ground_truth.reshape(-1, 1)
+    val_y = val_y.reshape(-1, 1).astype(np.float32)
+    val_x = np.asarray(val_x)
+    cache = {
+        "validation": _try_place_on_gpu(val_x, val_y, "validation"),
+        "n_validation": int(val_y.shape[0]),
+        "ambient": None,
+        "n_ambient": 0,
+    }
 
-    model.reset_metrics()
+    if data_processor.get_mode_size("validation_ambient") > 0:
+        ambient_x, ambient_y, _ = data_processor.get_data(
+            "validation_ambient",
+            batch_size=config["batch_size"],
+            features_length=config["spectrogram_length"],
+            truncation_strategy="split",
+            shuffle=False,
+        )
+        ambient_y = ambient_y.reshape(-1, 1).astype(np.float32)
+        ambient_x = np.asarray(ambient_x)
+        cache["ambient"] = _try_place_on_gpu(
+            ambient_x, ambient_y, "validation_ambient"
+        )
+        cache["n_ambient"] = int(ambient_y.shape[0])
 
-    result = model.evaluate(
-        testing_fingerprints,
-        testing_ground_truth,
-        batch_size=256,
-        return_dict=True,
-        verbose=0,
+    return cache
+
+
+def _evaluate_cached(eval_forward, metrics, features, labels, reset):
+    """Forward a cached split and update `metrics` in place."""
+    if reset:
+        for metric in metrics:
+            metric.reset_state()
+
+    count = int(features.shape[0])
+    for start in range(0, count, _EVAL_BATCH_SIZE):
+        end = min(start + _EVAL_BATCH_SIZE, count)
+        batch_x = features[start:end]
+        batch_y = labels[start:end]
+        if not _is_tensor(batch_x):
+            batch_x = tf.constant(batch_x)
+            batch_y = tf.constant(batch_y)
+        predictions = eval_forward(batch_x)
+        for metric in metrics:
+            metric.update_state(batch_y, predictions)
+
+    return {metric.name: _metric_numpy(metric) for metric in metrics}
+
+
+def validate_nonstreaming(
+    config,
+    data_processor,
+    model,
+    test_set,
+    eval_cache=None,
+    eval_forward=None,
+    metrics_list=None,
+):
+    if metrics_list is None:
+        metrics_list = list(model.metrics)
+
+    if eval_cache is None:
+        testing_fingerprints, testing_ground_truth, _ = data_processor.get_data(
+            test_set,
+            batch_size=config["batch_size"],
+            features_length=config["spectrogram_length"],
+            truncation_strategy="truncate_start",
+        )
+        testing_ground_truth = testing_ground_truth.reshape(-1, 1)
+        val_features, val_labels = testing_fingerprints, testing_ground_truth
+        n_validation = int(testing_ground_truth.shape[0])
+        ambient_pair = None
+        n_ambient = 0
+        if data_processor.get_mode_size("validation_ambient") > 0:
+            (
+                ambient_testing_fingerprints,
+                ambient_testing_ground_truth,
+                _,
+            ) = data_processor.get_data(
+                test_set + "_ambient",
+                batch_size=config["batch_size"],
+                features_length=config["spectrogram_length"],
+                truncation_strategy="split",
+            )
+            ambient_pair = (
+                ambient_testing_fingerprints,
+                ambient_testing_ground_truth.reshape(-1, 1),
+            )
+            n_ambient = int(ambient_pair[1].shape[0])
+    else:
+        val_features, val_labels = eval_cache["validation"]
+        n_validation = eval_cache["n_validation"]
+        ambient_pair = eval_cache["ambient"]
+        n_ambient = eval_cache["n_ambient"]
+        _consume_shuffle_rng(n_validation)
+        if n_ambient:
+            _consume_shuffle_rng(n_ambient)
+
+    if eval_forward is None:
+        @tf.function(jit_compile=True, reduce_retracing=True)
+        def eval_forward(inputs):
+            return model(inputs, training=False)
+
+    result = _evaluate_cached(
+        eval_forward, metrics_list, val_features, val_labels, reset=True
     )
 
     metrics = {}
@@ -75,28 +206,15 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
     test_set_fp = np.asarray(result["fp"])
 
-    if data_processor.get_mode_size("validation_ambient") > 0:
-        (
-            ambient_testing_fingerprints,
-            ambient_testing_ground_truth,
-            _,
-        ) = data_processor.get_data(
-            test_set + "_ambient",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="split",
+    if n_ambient > 0 and ambient_pair is not None:
+        ambient_features, ambient_labels = ambient_pair
+        ambient_predictions = _evaluate_cached(
+            eval_forward,
+            metrics_list,
+            ambient_features,
+            ambient_labels,
+            reset=False,
         )
-        ambient_testing_ground_truth = ambient_testing_ground_truth.reshape(-1, 1)
-
-        # XXX: tf no longer provides a way to evaluate a model without updating metrics
-        with swap_attribute(model, "reset_metrics", lambda: None):
-            ambient_predictions = model.evaluate(
-                ambient_testing_fingerprints,
-                ambient_testing_ground_truth,
-                batch_size=256,
-                return_dict=True,
-                verbose=0,
-            )
 
         duration_of_ambient_set = (
             data_processor.get_mode_duration("validation_ambient") / 3600.0
@@ -166,7 +284,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     return metrics
 
 
-def train(model, config, data_processor):
+def train(model, config, data_processor, prefetcher=None):
     # Assign default training settings if not set in the configuration yaml
     if not (training_steps_list := config.get("training_steps")):
         training_steps_list = [20000]
@@ -211,23 +329,53 @@ def train(model, config, data_processor):
 
     cutoffs = np.linspace(0.0, 1.0, 101).tolist()
 
-    metrics = [
-        tf.keras.metrics.BinaryAccuracy(name="accuracy"),
-        tf.keras.metrics.Recall(name="recall"),
-        tf.keras.metrics.Precision(name="precision"),
-        tf.keras.metrics.TruePositives(name="tp", thresholds=cutoffs),
-        tf.keras.metrics.FalsePositives(name="fp", thresholds=cutoffs),
-        tf.keras.metrics.TrueNegatives(name="tn", thresholds=cutoffs),
-        tf.keras.metrics.FalseNegatives(name="fn", thresholds=cutoffs),
-        tf.keras.metrics.AUC(name="auc"),
-        tf.keras.metrics.BinaryCrossentropy(name="loss"),
+    accuracy_metric = tf.keras.metrics.BinaryAccuracy(name="accuracy")
+    recall_metric = tf.keras.metrics.Recall(name="recall")
+    precision_metric = tf.keras.metrics.Precision(name="precision")
+    tp_metric = tf.keras.metrics.TruePositives(name="tp", thresholds=cutoffs)
+    fp_metric = tf.keras.metrics.FalsePositives(name="fp", thresholds=cutoffs)
+    tn_metric = tf.keras.metrics.TrueNegatives(name="tn", thresholds=cutoffs)
+    fn_metric = tf.keras.metrics.FalseNegatives(name="fn", thresholds=cutoffs)
+    auc_metric = tf.keras.metrics.AUC(name="auc")
+    bce_metric = tf.keras.metrics.BinaryCrossentropy(name="loss")
+
+    eval_metrics = [
+        accuracy_metric,
+        recall_metric,
+        precision_metric,
+        tp_metric,
+        fp_metric,
+        tn_metric,
+        fn_metric,
+        auc_metric,
+        bce_metric,
+    ]
+    # Threshold metrics are only consumed at validation time; keep the train
+    # graph to the five values that are actually logged each interval.
+    train_metrics = [
+        accuracy_metric,
+        recall_metric,
+        precision_metric,
+        auc_metric,
+        bce_metric,
     ]
 
-    model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+    model.compile(optimizer=optimizer, loss=loss, metrics=eval_metrics)
 
-    # We un-decorate the `tf.function`, it's very slow to manually run training batches
-    model.make_train_function()
-    _, model.train_function = tf_decorator.unwrap(model.train_function)
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def train_step(features, labels, sample_weights):
+        with tf.GradientTape() as tape:
+            predictions = model(features, training=True)
+            loss_value = loss(labels, predictions, sample_weight=sample_weights)
+        gradients = tape.gradient(loss_value, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        for metric in train_metrics:
+            metric.update_state(labels, predictions, sample_weight=sample_weights)
+        return loss_value
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def eval_forward(inputs):
+        return model(inputs, training=False)
 
     # Configure checkpointer and restore if available
     checkpoint_directory = os.path.join(config["train_dir"], "restore/")
@@ -243,11 +391,16 @@ def train(model, config, data_processor):
         os.path.join(config["summaries_dir"], "validation")
     )
 
+    logging.info("Preparing cached validation tensors")
+    eval_cache = prepare_eval_cache(config, data_processor)
+
     training_steps_max = np.sum(training_steps_list)
 
     best_minimization_quantity = 10000
     best_maximization_quantity = 0.0
     best_no_faph_cutoff = 1.0
+
+    use_prefetch = bool(prefetcher is not None and getattr(prefetcher, "started", False))
 
     for training_step in range(1, training_steps_max + 1):
         training_steps_sum = 0
@@ -265,7 +418,7 @@ def train(model, config, data_processor):
                 negative_class_weight = negative_class_weight_list[i]
                 break
 
-        model.optimizer.learning_rate.assign(learning_rate)
+        optimizer.learning_rate.assign(learning_rate)
 
         augmentation_policy = {
             "mix_up_prob": mix_up_prob,
@@ -276,64 +429,83 @@ def train(model, config, data_processor):
             "freq_mask_count": freq_mask_count,
         }
 
-        (
-            train_fingerprints,
-            train_ground_truth,
-            train_sample_weights,
-        ) = data_processor.get_data(
-            "training",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="default",
-            augmentation_policy=augmentation_policy,
-        )
+        if use_prefetch:
+            (
+                train_fingerprints,
+                train_ground_truth,
+                train_sample_weights,
+            ) = prefetcher.get_batch(augmentation_policy)
+        else:
+            (
+                train_fingerprints,
+                train_ground_truth,
+                train_sample_weights,
+            ) = data_processor.get_data(
+                "training",
+                batch_size=config["batch_size"],
+                features_length=config["spectrogram_length"],
+                truncation_strategy="default",
+                augmentation_policy=augmentation_policy,
+            )
 
+        train_ground_truth = np.asarray(train_ground_truth).reshape(-1)
+        train_sample_weights = np.asarray(train_sample_weights).reshape(-1)
+        combined_weights = (
+            train_sample_weights
+            * np.where(
+                train_ground_truth,
+                positive_class_weight,
+                negative_class_weight,
+            )
+        ).reshape(-1, 1)
         train_ground_truth = train_ground_truth.reshape(-1, 1)
 
-        class_weights = {0: negative_class_weight, 1: positive_class_weight}
-        combined_weights = train_sample_weights * np.vectorize(class_weights.get)(
-            train_ground_truth
-        )
-
-        result = model.train_on_batch(
-            train_fingerprints,
-            train_ground_truth,
-            sample_weight=combined_weights,
-        )
-
-        # Print the running statistics in the current validation epoch
-        print(
-            "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
-                (training_step // config["eval_step_interval"] + 1),
-                result[1],
-                result[2],
-                result[3],
-                result[9],
-                (training_step % config["eval_step_interval"]),
-            ),
-            end="\r",
+        train_step(
+            tf.convert_to_tensor(train_fingerprints, dtype=tf.float32),
+            tf.convert_to_tensor(train_ground_truth, dtype=tf.float32),
+            tf.convert_to_tensor(combined_weights, dtype=tf.float32),
         )
 
         is_last_step = training_step == training_steps_max
+        log_progress = (training_step % _PROGRESS_INTERVAL) == 0 or is_last_step
+        if log_progress:
+            # Host sync only on the progress cadence, not every step.
+            print(
+                "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
+                    (training_step // config["eval_step_interval"] + 1),
+                    _metric_float(accuracy_metric),
+                    _metric_float(recall_metric),
+                    _metric_float(precision_metric),
+                    _metric_float(bce_metric),
+                    (training_step % config["eval_step_interval"]),
+                ),
+                end="\r",
+            )
+
         if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
+            step_accuracy = _metric_float(accuracy_metric)
+            step_recall = _metric_float(recall_metric)
+            step_precision = _metric_float(precision_metric)
+            step_auc = _metric_float(auc_metric)
+            step_loss = _metric_float(bce_metric)
             logging.info(
                 "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
                 *(
                     training_step,
                     learning_rate,
-                    result[1] * 100,
-                    result[2] * 100,
-                    result[3] * 100,
-                    result[9],
+                    step_accuracy * 100,
+                    step_recall * 100,
+                    step_precision * 100,
+                    step_loss,
                 ),
             )
 
             with train_writer.as_default():
-                tf.summary.scalar("loss", result[9], step=training_step)
-                tf.summary.scalar("accuracy", result[1], step=training_step)
-                tf.summary.scalar("recall", result[2], step=training_step)
-                tf.summary.scalar("precision", result[3], step=training_step)
-                tf.summary.scalar("auc", result[8], step=training_step)
+                tf.summary.scalar("loss", step_loss, step=training_step)
+                tf.summary.scalar("accuracy", step_accuracy, step=training_step)
+                tf.summary.scalar("recall", step_recall, step=training_step)
+                tf.summary.scalar("precision", step_precision, step=training_step)
+                tf.summary.scalar("auc", step_auc, step=training_step)
                 train_writer.flush()
 
             model.save_weights(
@@ -341,7 +513,13 @@ def train(model, config, data_processor):
             )
 
             nonstreaming_metrics = validate_nonstreaming(
-                config, data_processor, model, "validation"
+                config,
+                data_processor,
+                model,
+                "validation",
+                eval_cache=eval_cache,
+                eval_forward=eval_forward,
+                metrics_list=eval_metrics,
             )
             model.reset_metrics()  # reset metrics for next validation epoch of training
             logging.info(

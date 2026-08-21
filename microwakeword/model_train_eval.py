@@ -96,7 +96,7 @@ def load_config(flags, model_module):
     return config
 
 
-def train_model(config, model, data_processor, restore_checkpoint):
+def train_model(config, model, data_processor, restore_checkpoint, prefetcher=None):
     """Trains a model.
 
     Args:
@@ -125,7 +125,7 @@ def train_model(config, model, data_processor, restore_checkpoint):
 
     utils.save_model_summary(model, config["train_dir"])
 
-    train.train(model, config, data_processor)
+    train.train(model, config, data_processor, prefetcher=prefetcher)
 
 
 def evaluate_model(
@@ -401,15 +401,34 @@ if __name__ == "__main__":
 
     data_processor = input_data.FeatureHandler(config)
 
+    # Fork prefetch workers before the Keras model initializes CUDA.
+    prefetcher = None
     if flags.train:
-        model = model_module.model(
-            flags, config["training_input_shape"], config["batch_size"]
-        )
-        logging.info(model.summary())
-        train_model(config, model, data_processor, flags.restore_checkpoint)
-    else:
-        if not os.path.isdir(config["train_dir"]):
-            raise ValueError('model is not trained set "--train 1" and retrain it')
+        from microwakeword.data_prefetch import TrainingPrefetcher
+
+        prefetcher = TrainingPrefetcher.from_config(config, data_processor)
+        if not prefetcher.start():
+            prefetcher = None
+
+    try:
+        if flags.train:
+            model = model_module.model(
+                flags, config["training_input_shape"], config["batch_size"]
+            )
+            logging.info(model.summary())
+            train_model(
+                config,
+                model,
+                data_processor,
+                flags.restore_checkpoint,
+                prefetcher=prefetcher,
+            )
+        else:
+            if not os.path.isdir(config["train_dir"]):
+                raise ValueError('model is not trained set "--train 1" and retrain it')
+    finally:
+        if prefetcher is not None:
+            prefetcher.stop()
 
     if (
         flags.test_tf_nonstreaming

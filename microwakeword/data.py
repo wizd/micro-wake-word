@@ -55,6 +55,11 @@ def spec_augment(
     time_frames = spectrogram.shape[0]
     freq_bins = spectrogram.shape[1]
 
+    if (time_mask_count <= 0 or time_mask_max_size <= 0) and (
+        freq_mask_count <= 0 or freq_mask_max_size <= 0
+    ):
+        return spectrogram
+
     # Spectrograms yielded from a generator are read only
     augmented_spectrogram = np.copy(spectrogram)
 
@@ -507,6 +512,7 @@ class FeatureHandler(object):
             "freq_mask_max_size": 0,
             "freq_mask_count": 0,
         },
+        shuffle: bool = True,
     ):
         """Gets spectrograms from the appropriate mode. Ensures spectrograms are the approriate length and optionally applies augmentation.
 
@@ -521,6 +527,7 @@ class FeatureHandler(object):
                 time_mask_count: the total number of separate time masks applied for SpecAugment
                 freq_mask_max_size: maximum size of frequency feature masks for SpecAugment
                 freq_mask_count: the total number of separate feature masks applied for SpecAugment
+            shuffle (bool): whether to shuffle the returned samples. Defaults to True.
 
         Returns:
             data: spectrograms in a NumPy array (or as a list if in mode is `*_ambient`)
@@ -590,8 +597,7 @@ class FeatureHandler(object):
 
         indices = np.arange(labels.shape[0])
 
-        if mode == "testing" or "validation":
-            # Randomize the order of the data, weights, and labels
+        if shuffle:
             np.random.shuffle(indices)
 
         return data[indices], labels[indices], weights[indices]
