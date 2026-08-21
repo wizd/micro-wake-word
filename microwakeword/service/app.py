@@ -85,6 +85,10 @@ def _to_response(
         metadata=record.get("metadata") or None,
         training_steps=int(record["training_steps"]),
         max_samples=int(record["max_samples"]),
+        actual_training_steps=record.get("actual_training_steps"),
+        early_stopped=bool(record.get("early_stopped", False)),
+        stop_reason=record.get("stop_reason"),
+        timings=record.get("timings"),
     )
 
 

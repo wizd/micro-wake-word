@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import os
+import json
+import time
 
 from absl import logging
 
@@ -324,6 +326,34 @@ def train(model, config, data_processor, prefetcher=None):
     pad_list_with_last_entry(positive_class_weight_list, training_step_iterations)
     pad_list_with_last_entry(negative_class_weight_list, training_step_iterations)
 
+    def settings_for_step(step):
+        training_steps_sum = 0
+        for index, step_count in enumerate(training_steps_list):
+            training_steps_sum += step_count
+            if step <= training_steps_sum:
+                return {
+                    "learning_rate": learning_rates_list[index],
+                    "mix_up_prob": mix_up_prob_list[index],
+                    "freq_mix_prob": freq_mix_prob_list[index],
+                    "time_mask_max_size": time_mask_max_size_list[index],
+                    "time_mask_count": time_mask_count_list[index],
+                    "freq_mask_max_size": freq_mask_max_size_list[index],
+                    "freq_mask_count": freq_mask_count_list[index],
+                    "positive_class_weight": positive_class_weight_list[index],
+                    "negative_class_weight": negative_class_weight_list[index],
+                }
+        raise ValueError(f"No training settings configured for step {step}")
+
+    def augmentation_policy(settings):
+        return {
+            "mix_up_prob": settings["mix_up_prob"],
+            "freq_mix_prob": settings["freq_mix_prob"],
+            "time_mask_max_size": settings["time_mask_max_size"],
+            "time_mask_count": settings["time_mask_count"],
+            "freq_mask_max_size": settings["freq_mask_max_size"],
+            "freq_mask_count": settings["freq_mask_count"],
+        }
+
     loss = tf.keras.losses.BinaryCrossentropy(from_logits=False)
     optimizer = tf.keras.optimizers.Adam()
 
@@ -363,14 +393,22 @@ def train(model, config, data_processor, prefetcher=None):
     model.compile(optimizer=optimizer, loss=loss, metrics=eval_metrics)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def train_step(features, labels, sample_weights):
+    def train_step(
+        features,
+        labels,
+        combined_weights,
+        update_training_metrics,
+    ):
+        labels = tf.reshape(labels, (-1, 1))
+        combined_weights = tf.reshape(combined_weights, (-1, 1))
         with tf.GradientTape() as tape:
             predictions = model(features, training=True)
-            loss_value = loss(labels, predictions, sample_weight=sample_weights)
+            loss_value = loss(labels, predictions, sample_weight=combined_weights)
         gradients = tape.gradient(loss_value, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        for metric in train_metrics:
-            metric.update_state(labels, predictions, sample_weight=sample_weights)
+        if update_training_metrics:
+            for metric in train_metrics:
+                metric.update_state(labels, predictions, sample_weight=combined_weights)
         return loss_value
 
     @tf.function(jit_compile=True, reduce_retracing=True)
@@ -392,7 +430,12 @@ def train(model, config, data_processor, prefetcher=None):
     )
 
     logging.info("Preparing cached validation tensors")
+    validation_cache_start = time.perf_counter()
     eval_cache = prepare_eval_cache(config, data_processor)
+    validation_cache_seconds = time.perf_counter() - validation_cache_start
+    logging.info(
+        "PERF validation_cache_seconds=%.3f", validation_cache_seconds
+    )
 
     training_steps_max = np.sum(training_steps_list)
 
@@ -401,40 +444,111 @@ def train(model, config, data_processor, prefetcher=None):
     best_no_faph_cutoff = 1.0
 
     use_prefetch = bool(prefetcher is not None and getattr(prefetcher, "started", False))
+    training_metric_interval = max(
+        1, int(os.getenv("MICROWAKEWORD_TRAIN_METRIC_INTERVAL", "50"))
+    )
+    if use_prefetch:
+        for step in range(
+            1, min(training_steps_max, prefetcher.queue_size) + 1
+        ):
+            prefetcher.submit(step, augmentation_policy(settings_for_step(step)))
+
+    use_tf_data = use_prefetch and os.getenv(
+        "MICROWAKEWORD_TF_DATA_PREFETCH", "false"
+    ).lower() in ("1", "true", "yes", "on")
+    training_iterator = None
+    if use_tf_data:
+        def batch_generator():
+            for step in range(1, training_steps_max + 1):
+                features, labels, weights, slot = prefetcher.get_batch(step)
+                try:
+                    settings = settings_for_step(step)
+                    combined_weights = weights * np.where(
+                        labels,
+                        settings["positive_class_weight"],
+                        settings["negative_class_weight"],
+                    )
+                    yield features, labels, combined_weights
+                finally:
+                    prefetcher.release(slot)
+                    future_step = step + prefetcher.queue_size
+                    if future_step <= training_steps_max:
+                        prefetcher.submit(
+                            future_step,
+                            augmentation_policy(settings_for_step(future_step)),
+                        )
+
+        output_signature = (
+            tf.TensorSpec(
+                shape=(
+                    config["batch_size"],
+                    config["spectrogram_length"],
+                    config["training_input_shape"][-1],
+                ),
+                dtype=tf.float32,
+            ),
+            tf.TensorSpec(shape=(config["batch_size"],), dtype=tf.float32),
+            tf.TensorSpec(shape=(config["batch_size"],), dtype=tf.float32),
+        )
+        dataset = tf.data.Dataset.from_generator(
+            batch_generator, output_signature=output_signature
+        )
+        if os.getenv("MICROWAKEWORD_PREFETCH_TO_GPU", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            dataset = dataset.apply(
+                tf.data.experimental.prefetch_to_device("/GPU:0", buffer_size=2)
+            )
+        else:
+            dataset = dataset.prefetch(2)
+        training_iterator = iter(dataset)
+
+    early_stop_enabled = bool(config.get("early_stop_enabled", False))
+    early_stop_min_steps = int(config.get("early_stop_min_steps", 3000))
+    early_stop_patience = int(config.get("early_stop_patience_evals", 5))
+    early_stop_min_delta = float(config.get("early_stop_min_delta", 1e-6))
+    early_stop_best = -np.inf
+    early_stop_stale_evals = 0
+    stop_reason = None
+    actual_training_steps = 0
+
+    perf = {
+        "batch_wait_seconds": 0.0,
+        "batch_prepare_seconds": 0.0,
+        "train_step_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "checkpoint_seconds": 0.0,
+    }
+    train_wall_start = time.perf_counter()
 
     for training_step in range(1, training_steps_max + 1):
-        training_steps_sum = 0
-        for i in range(len(training_steps_list)):
-            training_steps_sum += training_steps_list[i]
-            if training_step <= training_steps_sum:
-                learning_rate = learning_rates_list[i]
-                mix_up_prob = mix_up_prob_list[i]
-                freq_mix_prob = freq_mix_prob_list[i]
-                time_mask_max_size = time_mask_max_size_list[i]
-                time_mask_count = time_mask_count_list[i]
-                freq_mask_max_size = freq_mask_max_size_list[i]
-                freq_mask_count = freq_mask_count_list[i]
-                positive_class_weight = positive_class_weight_list[i]
-                negative_class_weight = negative_class_weight_list[i]
-                break
+        settings = settings_for_step(training_step)
+        learning_rate = settings["learning_rate"]
+        positive_class_weight = settings["positive_class_weight"]
+        negative_class_weight = settings["negative_class_weight"]
 
         optimizer.learning_rate.assign(learning_rate)
 
-        augmentation_policy = {
-            "mix_up_prob": mix_up_prob,
-            "freq_mix_prob": freq_mix_prob,
-            "time_mask_max_size": time_mask_max_size,
-            "time_mask_count": time_mask_count,
-            "freq_mask_max_size": freq_mask_max_size,
-            "freq_mask_count": freq_mask_count,
-        }
+        policy = augmentation_policy(settings)
 
-        if use_prefetch:
+        batch_wait_start = time.perf_counter()
+        prefetch_slot = None
+        if use_tf_data:
             (
                 train_fingerprints,
                 train_ground_truth,
                 train_sample_weights,
-            ) = prefetcher.get_batch(augmentation_policy)
+            ) = next(training_iterator)
+        elif use_prefetch:
+            (
+                train_fingerprints,
+                train_ground_truth,
+                train_sample_weights,
+                prefetch_slot,
+            ) = prefetcher.get_batch(training_step)
         else:
             (
                 train_fingerprints,
@@ -445,26 +559,42 @@ def train(model, config, data_processor, prefetcher=None):
                 batch_size=config["batch_size"],
                 features_length=config["spectrogram_length"],
                 truncation_strategy="default",
-                augmentation_policy=augmentation_policy,
+                augmentation_policy=policy,
             )
+        perf["batch_wait_seconds"] += time.perf_counter() - batch_wait_start
 
-        train_ground_truth = np.asarray(train_ground_truth).reshape(-1)
-        train_sample_weights = np.asarray(train_sample_weights).reshape(-1)
-        combined_weights = (
-            train_sample_weights
-            * np.where(
-                train_ground_truth,
+        batch_prepare_start = time.perf_counter()
+        if use_tf_data:
+            combined_weights = train_sample_weights
+        else:
+            combined_weights = np.asarray(train_sample_weights).reshape(-1) * np.where(
+                np.asarray(train_ground_truth).reshape(-1),
                 positive_class_weight,
                 negative_class_weight,
             )
-        ).reshape(-1, 1)
-        train_ground_truth = train_ground_truth.reshape(-1, 1)
+        feature_tensor = tf.convert_to_tensor(train_fingerprints, dtype=tf.float32)
+        label_tensor = tf.convert_to_tensor(train_ground_truth, dtype=tf.float32)
+        weight_tensor = tf.convert_to_tensor(combined_weights, dtype=tf.float32)
+        perf["batch_prepare_seconds"] += time.perf_counter() - batch_prepare_start
 
+        train_step_start = time.perf_counter()
         train_step(
-            tf.convert_to_tensor(train_fingerprints, dtype=tf.float32),
-            tf.convert_to_tensor(train_ground_truth, dtype=tf.float32),
-            tf.convert_to_tensor(combined_weights, dtype=tf.float32),
+            feature_tensor,
+            label_tensor,
+            weight_tensor,
+            training_step % training_metric_interval == 0,
         )
+        perf["train_step_seconds"] += time.perf_counter() - train_step_start
+
+        if prefetch_slot is not None and not use_tf_data:
+            prefetcher.release(prefetch_slot)
+            future_step = training_step + prefetcher.queue_size
+            if future_step <= training_steps_max:
+                prefetcher.submit(
+                    future_step,
+                    augmentation_policy(settings_for_step(future_step)),
+                )
+        actual_training_steps = training_step
 
         is_last_step = training_step == training_steps_max
         log_progress = (training_step % _PROGRESS_INTERVAL) == 0 or is_last_step
@@ -508,10 +638,12 @@ def train(model, config, data_processor, prefetcher=None):
                 tf.summary.scalar("auc", step_auc, step=training_step)
                 train_writer.flush()
 
+            checkpoint_start = time.perf_counter()
             model.save_weights(
                 os.path.join(config["train_dir"], "last_weights.weights.h5")
             )
 
+            validation_start = time.perf_counter()
             nonstreaming_metrics = validate_nonstreaming(
                 config,
                 data_processor,
@@ -521,6 +653,8 @@ def train(model, config, data_processor, prefetcher=None):
                 eval_forward=eval_forward,
                 metrics_list=eval_metrics,
             )
+            validation_elapsed = time.perf_counter() - validation_start
+            perf["validation_seconds"] += validation_elapsed
             model.reset_metrics()  # reset metrics for next validation epoch of training
             logging.info(
                 "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
@@ -637,7 +771,66 @@ def train(model, config, data_processor, prefetcher=None):
                 (best_maximization_quantity * 100),
                 best_no_faph_cutoff,
             )
+            perf["checkpoint_seconds"] += (
+                time.perf_counter() - checkpoint_start - validation_elapsed
+            )
+            logging.info(
+                "PERF step=%d batch_wait=%.3f batch_prepare=%.3f train_step=%.3f "
+                "validation=%.3f checkpoint=%.3f",
+                training_step,
+                perf["batch_wait_seconds"],
+                perf["batch_prepare_seconds"],
+                perf["train_step_seconds"],
+                perf["validation_seconds"],
+                perf["checkpoint_seconds"],
+            )
+
+            current_quality = float(current_maximization_quantity)
+            if current_quality > early_stop_best + early_stop_min_delta:
+                early_stop_best = current_quality
+                early_stop_stale_evals = 0
+            else:
+                early_stop_stale_evals += 1
+            target_met = (
+                current_minimization_quantity <= config["target_minimization"]
+            )
+            if (
+                early_stop_enabled
+                and target_met
+                and training_step >= early_stop_min_steps
+                and early_stop_stale_evals >= early_stop_patience
+            ):
+                stop_reason = (
+                    f"no improvement > {early_stop_min_delta:g} for "
+                    f"{early_stop_stale_evals} evaluations"
+                )
+                logging.info(
+                    "Early stopping at step %d: %s",
+                    training_step,
+                    stop_reason,
+                )
+                break
 
     # Save checkpoint after training
     checkpoint.save(file_prefix=checkpoint_prefix)
     model.save_weights(os.path.join(config["train_dir"], "last_weights.weights.h5"))
+    total_train_seconds = time.perf_counter() - train_wall_start
+    metadata = {
+        "requested_training_steps": int(training_steps_max),
+        "actual_training_steps": int(actual_training_steps),
+        "early_stopped": bool(stop_reason),
+        "stop_reason": stop_reason,
+        "best_step_metric": float(early_stop_best),
+        "timings": {
+            **perf,
+            "validation_cache_seconds": validation_cache_seconds,
+            "total_train_seconds": total_train_seconds,
+        },
+    }
+    with open(
+        os.path.join(config["train_dir"], "training_metadata.json"),
+        "w",
+        encoding="utf-8",
+    ) as metadata_file:
+        json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+    logging.info("PERF training_complete %s", json.dumps(metadata, sort_keys=True))

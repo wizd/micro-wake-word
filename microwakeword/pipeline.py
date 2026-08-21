@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import itertools
+import json
+import importlib.metadata
 import logging
 import os
 import re
@@ -35,6 +37,21 @@ DEFAULT_TRAINING_STEPS = int(os.getenv("MICROWAKEWORD_TRAINING_STEPS", "10000"))
 DEFAULT_TRAIN_BATCH = int(os.getenv("MICROWAKEWORD_TRAIN_BATCH", "256"))
 DEFAULT_HARD_NEG_PENALTY = float(os.getenv("MICROWAKEWORD_HARD_NEG_PENALTY", "3.0"))
 DEFAULT_HARD_NEG_SAMPLING = float(os.getenv("MICROWAKEWORD_HARD_NEG_SAMPLING", "10.0"))
+DEFAULT_EARLY_STOP = os.getenv("MICROWAKEWORD_EARLY_STOP", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DEFAULT_EARLY_STOP_MIN_STEPS = int(
+    os.getenv("MICROWAKEWORD_EARLY_STOP_MIN_STEPS", "3000")
+)
+DEFAULT_EARLY_STOP_PATIENCE = int(
+    os.getenv("MICROWAKEWORD_EARLY_STOP_PATIENCE", "5")
+)
+DEFAULT_EARLY_STOP_MIN_DELTA = float(
+    os.getenv("MICROWAKEWORD_EARLY_STOP_MIN_DELTA", "1e-6")
+)
 
 DEFAULT_SAMPLES_DIR = Path(os.getenv("MICROWAKEWORD_SAMPLES_DIR", "/samples"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("MICROWAKEWORD_OUTPUT_DIR", "/output"))
@@ -360,12 +377,147 @@ def ensure_wakeword_samples(
     )
 
 
+def _synthetic_asset_cache_key(wakeword: str, max_samples: int) -> str:
+    """Hash every input that affects generated samples/features."""
+    voice_model = DEFAULT_VOICE_MODEL
+    voice_config = DEFAULT_VOICE_CONFIG
+
+    def fingerprint(path: Path) -> dict:
+        try:
+            return {
+                "size": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        except OSError:
+            return {"path": str(path)}
+
+    try:
+        piper_version = importlib.metadata.version("piper-tts")
+    except importlib.metadata.PackageNotFoundError:
+        piper_version = "unknown"
+
+    payload = {
+        "version": 2,
+        "wakeword": wakeword,
+        "max_samples": int(max_samples),
+        "voice_model": fingerprint(voice_model),
+        "voice_config": fingerprint(voice_config),
+        "piper_version": piper_version,
+        "pipeline_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "audio_utils_sha256": hashlib.sha256(
+            (Path(__file__).parent / "audio" / "audio_utils.py").read_bytes()
+        ).hexdigest(),
+        "length_scales": [0.85, 0.95, 1.0, 1.1, 1.2],
+        "noise_scales": [0.55, 0.65, 0.75],
+        "noise_ws": [0.7, 0.8, 0.9],
+        "feature_config": {
+            "augmentation_duration_s": 3.2,
+            "slide_frames": {"training": 10, "validation": 10, "testing": 1},
+            "step_ms": 10,
+            "training_repetition": 2,
+            "augmentation_revision": 1,
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _link_or_copy(source: str, destination: str) -> None:
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def _ragged_mmap_complete(path: Path) -> bool:
+    return all(
+        (path / relative).exists()
+        for relative in (
+            "data.ninja",
+            "type.ninja",
+            "dtype.ninja",
+            "shape.ninja",
+            "order.ninja",
+            "starts/data.ninja",
+            "ends/data.ninja",
+        )
+    )
+
+
+def restore_synthetic_asset_cache(
+    cache_root: Path,
+    wakeword: str,
+    max_samples: int,
+    samples_dir: Path,
+    features_dir: Path,
+) -> bool:
+    key = _synthetic_asset_cache_key(wakeword, max_samples)
+    entry = cache_root / key
+    cached_samples = entry / "samples"
+    cached_features = entry / "features"
+    ready = entry / "READY"
+    if not (
+        ready.exists()
+        and len(list(cached_samples.glob("*.wav"))) >= max_samples
+        and all(
+            _ragged_mmap_complete(cached_features / split / "wakeword_mmap")
+            for split in ("training", "validation", "testing")
+        )
+    ):
+        return False
+
+    shutil.copytree(cached_samples, samples_dir, copy_function=_link_or_copy)
+    shutil.copytree(cached_features, features_dir, copy_function=_link_or_copy)
+    logging.info("restored synthetic samples/features cache key=%s", key[:12])
+    return True
+
+
+def publish_synthetic_asset_cache(
+    cache_root: Path,
+    wakeword: str,
+    max_samples: int,
+    samples_dir: Path,
+    features_dir: Path,
+) -> None:
+    key = _synthetic_asset_cache_key(wakeword, max_samples)
+    entry = cache_root / key
+    if (entry / "READY").exists():
+        return
+    cache_root.mkdir(parents=True, exist_ok=True)
+    temporary = cache_root / f".{key}.{os.getpid()}.tmp"
+    shutil.rmtree(temporary, ignore_errors=True)
+    temporary.mkdir(parents=True)
+    try:
+        shutil.copytree(
+            samples_dir, temporary / "samples", copy_function=_link_or_copy
+        )
+        shutil.copytree(
+            features_dir, temporary / "features", copy_function=_link_or_copy
+        )
+        (temporary / "READY").write_text(key, encoding="utf-8")
+        try:
+            temporary.replace(entry)
+        except OSError:
+            if not entry.exists():
+                raise
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
 def ensure_negative_datasets(base_dir: Path) -> None:
     base_dir.mkdir(parents=True, exist_ok=True)
     for archive, folder in NEGATIVE_DATASETS.items():
         target_dir = base_dir / folder
-        training_dir = target_dir / "training"
-        if training_dir.exists() and any(training_dir.iterdir()):
+        mmap_directories = (
+            [
+                path
+                for path in target_dir.rglob("*_mmap")
+                if path.is_dir() and _ragged_mmap_complete(path)
+            ]
+            if target_dir.exists()
+            else []
+        )
+        if mmap_directories:
             logging.info("negative dataset '%s' already present", folder)
             continue
 
@@ -604,6 +756,10 @@ def write_training_config(
         "target_minimization": 0.9,
         "minimization_metric": None,
         "maximization_metric": "average_viable_recall",
+        "early_stop_enabled": DEFAULT_EARLY_STOP,
+        "early_stop_min_steps": DEFAULT_EARLY_STOP_MIN_STEPS,
+        "early_stop_patience_evals": DEFAULT_EARLY_STOP_PATIENCE,
+        "early_stop_min_delta": DEFAULT_EARLY_STOP_MIN_DELTA,
     }
 
     if custom_negative_features_dir:
@@ -861,6 +1017,16 @@ def run_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
+    synthetic_cache_hit = False
+    synthetic_cache_root = cache_dir / "synthetic_asset_cache"
+    if not use_external_samples:
+        synthetic_cache_hit = restore_synthetic_asset_cache(
+            synthetic_cache_root,
+            wakeword,
+            req.max_samples,
+            samples_dir,
+            features_dir,
+        )
 
     stage("synthesize")
     if not use_external_samples:
@@ -876,6 +1042,14 @@ def run_pipeline(
 
     stage("features")
     generate_positive_feature_sets(samples_dir, features_dir)
+    if not use_external_samples and not synthetic_cache_hit:
+        publish_synthetic_asset_cache(
+            synthetic_cache_root,
+            wakeword,
+            req.max_samples,
+            samples_dir,
+            features_dir,
+        )
     custom_negative_features_dir = None
     if custom_negative_dir:
         custom_negative_features_dir = session_dir / "custom_negative_features"

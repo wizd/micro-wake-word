@@ -19,6 +19,7 @@ import os
 import sys
 import yaml
 import platform
+import time
 from absl import logging
 
 import tensorflow as tf
@@ -173,11 +174,16 @@ def evaluate_model(
         # Save the internal streaming model to disk
         logging.info("Saving streaming model")
 
+        export_start = time.perf_counter()
         utils.convert_model_saved(
             model,
             config,
             folder="stream_state_internal",
             mode=modes.Modes.STREAM_INTERNAL_STATE_INFERENCE,
+        )
+        logging.info(
+            "PERF saved_model_export_seconds=%.3f",
+            time.perf_counter() - export_start,
         )
 
     if test_tf_nonstreaming:
@@ -249,6 +255,7 @@ def evaluate_model(
     for tflite_config in tflite_configs:
         logging.info("Converting %s to TFLite", tflite_config["log_string"])
 
+        conversion_start = time.perf_counter()
         utils.convert_saved_model_to_tflite(
             config,
             audio_processor=data_processor,
@@ -257,12 +264,18 @@ def evaluate_model(
             fname=tflite_config["filename"],
             quantize=tflite_config["quantize"],
         )
+        logging.info(
+            "PERF tflite_conversion_seconds=%.3f model=%s",
+            time.perf_counter() - conversion_start,
+            tflite_config["log_string"],
+        )
 
         logging.info(
             "Testing the TFLite %s false accept per hour and false rejection rates at various cutoffs.",
             tflite_config["log_string"],
         )
 
+        roc_start = time.perf_counter()
         test.tflite_streaming_model_roc(
             config,
             tflite_config["output_folder"],
@@ -271,6 +284,11 @@ def evaluate_model(
             ambient_set=tflite_config["testing_ambient_dataset"],
             tflite_model_name=tflite_config["filename"],
             accuracy_name="tflite_streaming_roc.txt",
+        )
+        logging.info(
+            "PERF tflite_roc_seconds=%.3f model=%s",
+            time.perf_counter() - roc_start,
+            tflite_config["log_string"],
         )
 
 

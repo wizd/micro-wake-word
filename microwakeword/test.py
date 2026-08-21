@@ -132,10 +132,9 @@ def compute_false_accepts_per_hour(
                 wakeword_probability > cutoffs
             )  # a list of detection states at each cutoff
 
-            for index in range(cutoffs_count):
-                if cooldown_at_cutoffs[index] == 0 and detection_boolean[index]:
-                    false_accepts_at_cutoffs[index] += 1
-                    cooldown_at_cutoffs[index] = ignore_slices_after_accept
+            accepted = (cooldown_at_cutoffs == 0) & detection_boolean
+            false_accepts_at_cutoffs += accepted
+            cooldown_at_cutoffs[accepted] = ignore_slices_after_accept
 
     return false_accepts_at_cutoffs / probabilities_duration_h
 
@@ -376,12 +375,11 @@ def tflite_streaming_model_roc(
             positive_sample_streaming_probabilities.append(np.max(moving_average))
 
     # Compute the false negative rates at each cutoff
-    false_negative_rate_at_cutoffs = []
-    for cutoff in cutoffs:
-        true_accepts = sum(i > cutoff for i in positive_sample_streaming_probabilities)
-        false_negative_rate_at_cutoffs.append(
-            1 - true_accepts / len(positive_sample_streaming_probabilities)
-        )
+    positive_probabilities = np.asarray(positive_sample_streaming_probabilities)
+    true_accepts = np.sum(positive_probabilities[:, None] > cutoffs[None, :], axis=0)
+    false_negative_rate_at_cutoffs = (
+        1 - true_accepts / len(positive_sample_streaming_probabilities)
+    )
 
     x_coordinates, y_coordinates, cutoffs_at_points = generate_roc_curve(
         false_accepts_per_hour=faph,

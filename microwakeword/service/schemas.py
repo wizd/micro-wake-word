@@ -43,6 +43,10 @@ class JobResponse(BaseModel):
     metadata: Optional[dict[str, Any]] = None
     training_steps: int
     max_samples: int
+    actual_training_steps: Optional[int] = None
+    early_stopped: bool = False
+    stop_reason: Optional[str] = None
+    timings: Optional[dict[str, float]] = None
 
 
 class JobListResponse(BaseModel):

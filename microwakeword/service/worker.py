@@ -222,6 +222,7 @@ class TrainingWorker:
         self._current_proc = proc
 
         model_path: Optional[Path] = None
+        result_metadata: dict[str, Any] = {}
         error: Optional[str] = None
         final_status = "succeeded"
 
@@ -250,6 +251,12 @@ class TrainingWorker:
                 result = json.loads(result_file.read_text(encoding="utf-8"))
                 if result.get("ok"):
                     model_path = Path(result["model_path"])
+                    result_metadata = {
+                        "actual_training_steps": result.get("actual_training_steps"),
+                        "early_stopped": bool(result.get("early_stopped", False)),
+                        "stop_reason": result.get("stop_reason"),
+                        "timings": result.get("timings"),
+                    }
                     final_status = "succeeded"
                 elif result.get("cancelled"):
                     final_status = "cancelled"
@@ -287,6 +294,7 @@ class TrainingWorker:
             finished_at=finished,
             error=error,
             model_path=str(model_path) if model_path else None,
+            **result_metadata,
         )
 
         self._current_job_id = None

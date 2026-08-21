@@ -60,8 +60,25 @@ def main() -> None:
             cancel=cancel,
             on_stage=on_stage,
         )
+        metadata = {}
+        metadata_files = list(
+            Path(args.request_json).parent.glob(
+                "trained_models/*/training_metadata.json"
+            )
+        )
+        if metadata_files:
+            metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
         Path(args.result_file).write_text(
-            json.dumps({"ok": True, "model_path": str(model_path)}),
+            json.dumps(
+                {
+                    "ok": True,
+                    "model_path": str(model_path),
+                    "actual_training_steps": metadata.get("actual_training_steps"),
+                    "early_stopped": metadata.get("early_stopped", False),
+                    "stop_reason": metadata.get("stop_reason"),
+                    "timings": metadata.get("timings"),
+                }
+            ),
             encoding="utf-8",
         )
     except PipelineCancelled:

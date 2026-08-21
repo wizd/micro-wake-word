@@ -17,6 +17,8 @@
 """Functions and classes for using microwakeword models with audio files/data"""
 
 # imports
+import os
+
 import numpy as np
 from ai_edge_litert.interpreter import Interpreter
 from microwakeword.audio.audio_utils import generate_features_for_clip
@@ -35,6 +37,7 @@ class Model:
         # Load tflite model
         interpreter = Interpreter(
             model_path=tflite_model_path,
+            num_threads=int(os.getenv("MICROWAKEWORD_TFLITE_THREADS", "1")),
         )
         interpreter.allocate_tensors()
 
@@ -43,6 +46,16 @@ class Model:
 
         self.is_quantized_model = self.input_details[0]["dtype"] == np.int8
         self.input_feature_slices = self.input_details[0]["shape"][1]
+        self.input_index = self.input_details[0]["index"]
+        self.input_shape = tuple(self.input_details[0]["shape"])
+        self.output_index = self.output_details[0]["index"]
+        input_quantization = self.input_details[0]["quantization_parameters"]
+        self.input_scale = (
+            input_quantization["scales"][0] if self.is_quantized_model else None
+        )
+        self.input_zero_point = (
+            input_quantization["zero_points"][0] if self.is_quantized_model else None
+        )
 
         if stride is None:
             self.stride = self.input_feature_slices
@@ -95,28 +108,26 @@ class Model:
         elif np.issubdtype(spectrogram.dtype, np.float64):
             spectrogram = spectrogram.astype(np.float32)
 
-        # Slice the input data into the required number of chunks
-        chunks = []
+        # Quantization is element-wise, so doing it once for the full track is
+        # equivalent to repeating it for every overlapping chunk.
+        if self.is_quantized_model and spectrogram.dtype != np.int8:
+            spectrogram = (
+                spectrogram / self.input_scale + self.input_zero_point
+            ).astype(self.input_details[0]["dtype"])
+
+        # Stream chunks directly instead of materializing an intermediate list.
+        predictions = []
         for last_index in range(
             self.input_feature_slices, len(spectrogram) + 1, self.stride
         ):
             chunk = spectrogram[last_index - self.input_feature_slices : last_index]
-            if len(chunk) == self.input_feature_slices:
-                chunks.append(chunk)
-
-        # Get the prediction for each chunk
-        predictions = []
-        for chunk in chunks:
-            if self.is_quantized_model and spectrogram.dtype != np.int8:
-                chunk = self.quantize_input_data(chunk, self.input_details[0])
-
             self.model.set_tensor(
-                self.input_details[0]["index"],
-                np.reshape(chunk, self.input_details[0]["shape"]),
+                self.input_index,
+                chunk.reshape(self.input_shape),
             )
             self.model.invoke()
 
-            output = self.model.get_tensor(self.output_details[0]["index"])[0][0]
+            output = self.model.get_tensor(self.output_index)[0][0]
             if self.is_quantized_model:
                 output = self.dequantize_output_data(output, self.output_details[0])
 
