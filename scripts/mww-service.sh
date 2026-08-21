@@ -25,6 +25,15 @@ export PYTHONUNBUFFERED=1
 export HF_DATASETS_AUDIO_DECODER=soundfile
 export DATASETS_AUDIO_BACKEND=soundfile
 
+# Optional secrets (do not commit). Example: MWW_API_KEY=...
+ENV_FILE="${MWW_ENV_FILE:-$WORKSPACE/mww.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 # NOTE: network_turbo breaks conda/pip mirrors — do not source it for this service.
 # HuggingFace assets are fetched via MICROWAKEWORD_HF_ENDPOINT (hf-mirror).
 
