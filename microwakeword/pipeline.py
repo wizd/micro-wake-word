@@ -31,6 +31,34 @@ NEGATIVE_DATASETS = {
     "speech.zip": "speech",
 }
 
+# Feature-cache schema. Bump whenever positive-feature augmentation changes
+# so restore_synthetic_asset_cache cannot reuse dry TTS spectrograms.
+AUGMENTATION_REVISION = 2
+
+TRAIN_AUGMENTATION_PROBABILITIES = {
+    "SevenBandParametricEQ": 0.1,
+    "TanhDistortion": 0.1,
+    "PitchShift": 0.1,
+    "BandStopFilter": 0.1,
+    "AddColorNoise": 0.25,
+    "AddBackgroundNoise": 0.75,
+    "Gain": 1.0,
+    "RIR": 0.5,
+}
+
+# Testing is intentionally harder than training: every clip is reverberated
+# and mixed with noise so a 100% score actually means generalization.
+TEST_AUGMENTATION_PROBABILITIES = {
+    "SevenBandParametricEQ": 0.1,
+    "TanhDistortion": 0.1,
+    "PitchShift": 0.1,
+    "BandStopFilter": 0.1,
+    "AddColorNoise": 0.25,
+    "AddBackgroundNoise": 1.0,
+    "Gain": 1.0,
+    "RIR": 1.0,
+}
+
 DEFAULT_SAMPLE_COUNT = int(os.getenv("MICROWAKEWORD_SAMPLE_COUNT", "400"))
 DEFAULT_BATCH_SIZE = int(os.getenv("MICROWAKEWORD_SAMPLE_BATCH", "50"))
 DEFAULT_TRAINING_STEPS = int(os.getenv("MICROWAKEWORD_TRAINING_STEPS", "10000"))
@@ -72,6 +100,24 @@ DEFAULT_VOICE_CONFIG = Path(
         "/opt/piper-voices/zh_CN-huayan-medium.onnx.json",
     )
 )
+DEFAULT_TEST_VOICE_MODEL = Path(
+    os.getenv(
+        "MICROWAKEWORD_TEST_VOICE_MODEL",
+        "/opt/piper-voices/zh_CN-huayan-x_low.onnx",
+    )
+)
+DEFAULT_TEST_VOICE_CONFIG = Path(
+    os.getenv(
+        "MICROWAKEWORD_TEST_VOICE_CONFIG",
+        "/opt/piper-voices/zh_CN-huayan-x_low.onnx.json",
+    )
+)
+DEFAULT_AUGMENTATION_DIR = Path(
+    os.getenv(
+        "MICROWAKEWORD_AUGMENTATION_DIR",
+        "/opt/augmentation-datasets",
+    )
+)
 
 # HuggingFace endpoint can be mirrored via MICROWAKEWORD_HF_ENDPOINT
 # e.g. https://hf-mirror.com
@@ -89,12 +135,40 @@ DEFAULT_VOICE_CONFIG_URL = os.getenv(
     f"{_HF_ENDPOINT}/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/"
     "zh_CN-huayan-medium.onnx.json?download=true",
 )
+DEFAULT_TEST_VOICE_URL = os.getenv(
+    "MICROWAKEWORD_TEST_VOICE_URL",
+    f"{_HF_ENDPOINT}/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/x_low/"
+    "zh_CN-huayan-x_low.onnx?download=true",
+)
+DEFAULT_TEST_VOICE_CONFIG_URL = os.getenv(
+    "MICROWAKEWORD_TEST_VOICE_CONFIG_URL",
+    f"{_HF_ENDPOINT}/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/x_low/"
+    "zh_CN-huayan-x_low.onnx.json?download=true",
+)
 NEGATIVE_DATASET_ROOT = os.getenv(
     "MICROWAKEWORD_NEGATIVE_DATASET_ROOT",
     f"{_HF_ENDPOINT}/datasets/kahrendt/microwakeword/resolve/main/",
 )
 if not NEGATIVE_DATASET_ROOT.endswith("/"):
     NEGATIVE_DATASET_ROOT += "/"
+
+DEFAULT_RIR_URL = os.getenv(
+    "MICROWAKEWORD_RIR_URL",
+    "https://mcdermottlab.mit.edu/Reverb/IRMAudio/Audio.zip",
+)
+DEFAULT_NOISE_URL = os.getenv("MICROWAKEWORD_NOISE_URL", "")
+DEFAULT_NOISE_INDEX_URL = os.getenv(
+    "MICROWAKEWORD_NOISE_INDEX_URL",
+    "https://cdn.jsdelivr.net/gh/karolpiczak/ESC-50@master/meta/esc50.csv",
+)
+DEFAULT_NOISE_FILE_URL = os.getenv(
+    "MICROWAKEWORD_NOISE_FILE_URL",
+    "https://cdn.jsdelivr.net/gh/karolpiczak/ESC-50@master/audio/{filename}",
+)
+RIR_MIN_WAVS = int(os.getenv("MICROWAKEWORD_RIR_MIN_WAVS", "20"))
+NOISE_MIN_WAVS = int(os.getenv("MICROWAKEWORD_NOISE_MIN_WAVS", "20"))
+NOISE_FILE_COUNT = int(os.getenv("MICROWAKEWORD_NOISE_FILE_COUNT", "40"))
+DOWNLOAD_TIMEOUT_S = int(os.getenv("MICROWAKEWORD_DOWNLOAD_TIMEOUT", "120"))
 
 
 @dataclass
@@ -206,23 +280,28 @@ def download_file(url: str, destination: Path) -> None:
     import urllib.request
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(urllib.request.urlopen(url)) as response, destination.open(
-        "wb"
-    ) as output:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "microwakeword-pipeline/1.0"}
+    )
+    with contextlib.closing(
+        urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_S)
+    ) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output)
 
 
 def ensure_voice_assets(
     model_path: Path = DEFAULT_VOICE_MODEL,
     config_path: Path = DEFAULT_VOICE_CONFIG,
+    model_url: str = DEFAULT_VOICE_URL,
+    config_url: str = DEFAULT_VOICE_CONFIG_URL,
 ) -> tuple[Path, Path]:
     if not model_path.exists():
-        logging.info("downloading piper voice model from %s", DEFAULT_VOICE_URL)
-        download_file(DEFAULT_VOICE_URL, model_path)
+        logging.info("downloading piper voice model from %s", model_url)
+        download_file(model_url, model_path)
 
     if not config_path.exists():
-        logging.info("downloading piper voice config from %s", DEFAULT_VOICE_CONFIG_URL)
-        download_file(DEFAULT_VOICE_CONFIG_URL, config_path)
+        logging.info("downloading piper voice config from %s", config_url)
+        download_file(config_url, config_path)
 
     return model_path, config_path
 
@@ -273,10 +352,14 @@ def ensure_ort_cuda_libraries() -> None:
 def load_voice(
     model_path: Path = DEFAULT_VOICE_MODEL,
     config_path: Path = DEFAULT_VOICE_CONFIG,
+    model_url: str = DEFAULT_VOICE_URL,
+    config_url: str = DEFAULT_VOICE_CONFIG_URL,
 ):
     from piper import PiperVoice  # type: ignore[import-not-found]
 
-    model_path, config_path = ensure_voice_assets(model_path, config_path)
+    model_path, config_path = ensure_voice_assets(
+        model_path, config_path, model_url=model_url, config_url=config_url
+    )
     use_cuda = should_use_cuda()
     if use_cuda:
         ensure_ort_cuda_libraries()
@@ -359,16 +442,29 @@ def synthesize_wakeword_samples(
 
 
 def ensure_wakeword_samples(
-    *, wakeword: str, samples_dir: Path, max_samples: int, batch_size: int
+    *,
+    wakeword: str,
+    samples_dir: Path,
+    max_samples: int,
+    batch_size: int,
+    voice_model: Path = DEFAULT_VOICE_MODEL,
+    voice_config: Path = DEFAULT_VOICE_CONFIG,
+    voice_url: str = DEFAULT_VOICE_URL,
+    voice_config_url: str = DEFAULT_VOICE_CONFIG_URL,
 ) -> None:
     _ = batch_size  # retained for CLI compatibility
 
     samples_dir.mkdir(parents=True, exist_ok=True)
     if list(samples_dir.rglob("*.wav")):
-        logging.info("wake word samples already exist; skipping synthesis")
+        logging.info("wake word samples already exist in %s; skipping synthesis", samples_dir)
         return
 
-    voice = load_voice()
+    voice = load_voice(
+        voice_model,
+        voice_config,
+        model_url=voice_url,
+        config_url=voice_config_url,
+    )
     synthesize_wakeword_samples(
         voice=voice,
         wakeword=wakeword,
@@ -377,31 +473,31 @@ def ensure_wakeword_samples(
     )
 
 
+def _path_fingerprint(path: Path) -> dict:
+    try:
+        return {
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    except OSError:
+        return {"path": str(path)}
+
+
 def _synthetic_asset_cache_key(wakeword: str, max_samples: int) -> str:
     """Hash every input that affects generated samples/features."""
-    voice_model = DEFAULT_VOICE_MODEL
-    voice_config = DEFAULT_VOICE_CONFIG
-
-    def fingerprint(path: Path) -> dict:
-        try:
-            return {
-                "size": path.stat().st_size,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-        except OSError:
-            return {"path": str(path)}
-
     try:
         piper_version = importlib.metadata.version("piper-tts")
     except importlib.metadata.PackageNotFoundError:
         piper_version = "unknown"
 
     payload = {
-        "version": 2,
+        "version": 3,
         "wakeword": wakeword,
         "max_samples": int(max_samples),
-        "voice_model": fingerprint(voice_model),
-        "voice_config": fingerprint(voice_config),
+        "voice_model": _path_fingerprint(DEFAULT_VOICE_MODEL),
+        "voice_config": _path_fingerprint(DEFAULT_VOICE_CONFIG),
+        "test_voice_model": _path_fingerprint(DEFAULT_TEST_VOICE_MODEL),
+        "test_voice_config": _path_fingerprint(DEFAULT_TEST_VOICE_CONFIG),
         "piper_version": piper_version,
         "pipeline_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "audio_utils_sha256": hashlib.sha256(
@@ -415,7 +511,9 @@ def _synthetic_asset_cache_key(wakeword: str, max_samples: int) -> str:
             "slide_frames": {"training": 10, "validation": 10, "testing": 1},
             "step_ms": 10,
             "training_repetition": 2,
-            "augmentation_revision": 1,
+            "augmentation_revision": AUGMENTATION_REVISION,
+            "train_augmentation": TRAIN_AUGMENTATION_PROBABILITIES,
+            "test_augmentation": TEST_AUGMENTATION_PROBABILITIES,
         },
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -450,15 +548,21 @@ def restore_synthetic_asset_cache(
     max_samples: int,
     samples_dir: Path,
     features_dir: Path,
+    heldout_dir: Path | None = None,
 ) -> bool:
     key = _synthetic_asset_cache_key(wakeword, max_samples)
     entry = cache_root / key
     cached_samples = entry / "samples"
     cached_features = entry / "features"
+    cached_heldout = entry / "heldout"
     ready = entry / "READY"
+    heldout_ok = heldout_dir is None or (
+        cached_heldout.exists() and len(list(cached_heldout.glob("*.wav"))) > 0
+    )
     if not (
         ready.exists()
         and len(list(cached_samples.glob("*.wav"))) >= max_samples
+        and heldout_ok
         and all(
             _ragged_mmap_complete(cached_features / split / "wakeword_mmap")
             for split in ("training", "validation", "testing")
@@ -468,6 +572,8 @@ def restore_synthetic_asset_cache(
 
     shutil.copytree(cached_samples, samples_dir, copy_function=_link_or_copy)
     shutil.copytree(cached_features, features_dir, copy_function=_link_or_copy)
+    if heldout_dir is not None and cached_heldout.exists():
+        shutil.copytree(cached_heldout, heldout_dir, copy_function=_link_or_copy)
     logging.info("restored synthetic samples/features cache key=%s", key[:12])
     return True
 
@@ -478,6 +584,7 @@ def publish_synthetic_asset_cache(
     max_samples: int,
     samples_dir: Path,
     features_dir: Path,
+    heldout_dir: Path | None = None,
 ) -> None:
     key = _synthetic_asset_cache_key(wakeword, max_samples)
     entry = cache_root / key
@@ -494,6 +601,10 @@ def publish_synthetic_asset_cache(
         shutil.copytree(
             features_dir, temporary / "features", copy_function=_link_or_copy
         )
+        if heldout_dir is not None and heldout_dir.exists():
+            shutil.copytree(
+                heldout_dir, temporary / "heldout", copy_function=_link_or_copy
+            )
         (temporary / "READY").write_text(key, encoding="utf-8")
         try:
             temporary.replace(entry)
@@ -534,12 +645,143 @@ def ensure_negative_datasets(base_dir: Path) -> None:
         logging.info("completed extraction of '%s'", folder)
 
 
-def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> None:
+def _wav_count(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    return sum(1 for _ in directory.rglob("*.wav"))
+
+
+def _extract_archive(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "r") as zip_file:
+        zip_file.extractall(destination)
+
+
+def _download_audio_archive(
+    *, url: str, archive_path: Path, extract_dir: Path, min_wavs: int, label: str
+) -> Path:
+    if _wav_count(extract_dir) >= min_wavs:
+        logging.info("%s dataset already present (%d wavs)", label, _wav_count(extract_dir))
+        return extract_dir
+    if not archive_path.exists():
+        logging.info("downloading %s dataset from %s", label, url)
+        download_file(url, archive_path)
+    logging.info("extracting %s dataset", label)
+    _extract_archive(archive_path, extract_dir)
+    count = _wav_count(extract_dir)
+    if count < min_wavs:
+        raise FileNotFoundError(
+            f"{label} dataset at {extract_dir} has {count} wav files; need >= {min_wavs}"
+        )
+    logging.info("completed %s dataset extraction (%d wavs)", label, count)
+    return extract_dir
+
+
+def _download_esc50_files(destination: Path, count: int = NOISE_FILE_COUNT) -> Path:
+    """Fetch a class-strided ESC-50 subset via jsDelivr (avoids a 600MB GitHub zip)."""
+    destination.mkdir(parents=True, exist_ok=True)
+    index_path = destination / "esc50.csv"
+    if not index_path.exists():
+        logging.info("downloading ESC-50 index from %s", DEFAULT_NOISE_INDEX_URL)
+        download_file(DEFAULT_NOISE_INDEX_URL, index_path)
+    names: list[str] = []
+    for line in index_path.read_text(encoding="utf-8").splitlines()[1:]:
+        filename = line.split(",")[0].strip()
+        if filename.endswith(".wav"):
+            names.append(filename)
+    if not names:
+        raise FileNotFoundError(f"ESC-50 index {index_path} contained no wav names")
+    step = max(1, len(names) // max(1, count))
+    chosen = names[::step][:count]
+    audio_dir = destination / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    for name in chosen:
+        dest = audio_dir / name
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        download_file(DEFAULT_NOISE_FILE_URL.format(filename=name), dest)
+        if dest.exists() and dest.stat().st_size == 0:
+            dest.unlink()
+            download_file(DEFAULT_NOISE_FILE_URL.format(filename=name), dest)
+    found = _wav_count(destination)
+    if found < min(count, NOISE_MIN_WAVS):
+        raise FileNotFoundError(
+            f"ESC-50 subset at {destination} has {found} wav files; need >= {NOISE_MIN_WAVS}"
+        )
+    logging.info("completed ESC-50 subset download (%d wavs)", found)
+    return destination
+
+
+def ensure_augmentation_datasets(
+    base_dir: Path = DEFAULT_AUGMENTATION_DIR,
+) -> tuple[list[str], list[str]]:
+    """Download MIT IR Survey + ESC-50 and return (impulse_paths, background_paths)."""
+    base_dir.mkdir(parents=True, exist_ok=True)
+    impulse_dir = _download_audio_archive(
+        url=DEFAULT_RIR_URL,
+        archive_path=base_dir / "mit_ir_survey.zip",
+        extract_dir=base_dir / "rir",
+        min_wavs=RIR_MIN_WAVS,
+        label="RIR",
+    )
+    noise_dir = base_dir / "noise"
+    if DEFAULT_NOISE_URL:
+        background_dir = _download_audio_archive(
+            url=DEFAULT_NOISE_URL,
+            archive_path=base_dir / "noise.zip",
+            extract_dir=noise_dir,
+            min_wavs=NOISE_MIN_WAVS,
+            label="noise",
+        )
+    else:
+        if _wav_count(noise_dir) >= NOISE_MIN_WAVS:
+            logging.info(
+                "noise dataset already present (%d wavs)", _wav_count(noise_dir)
+            )
+            background_dir = noise_dir
+        else:
+            background_dir = _download_esc50_files(noise_dir)
+    return [str(impulse_dir)], [str(background_dir)]
+
+
+def _build_augmenter(
+    probabilities: dict,
+    impulse_paths: list[str],
+    background_paths: list[str],
+):
+    from microwakeword.audio.augmentation import Augmentation
+
+    if not impulse_paths or not background_paths:
+        raise ValueError(
+            "acoustic augmentation requires both impulse_paths and background_paths"
+        )
+    return Augmentation(
+        augmentation_duration_s=3.2,
+        augmentation_probabilities=probabilities,
+        impulse_paths=impulse_paths,
+        background_paths=background_paths,
+        background_min_snr_db=-5,
+        background_max_snr_db=10,
+        min_jitter_s=0.195,
+        max_jitter_s=0.205,
+    )
+
+
+def generate_positive_feature_sets(
+    samples_dir: Path,
+    features_dir: Path,
+    *,
+    heldout_samples_dir: Path | None = None,
+    impulse_paths: list[str] | None = None,
+    background_paths: list[str] | None = None,
+) -> None:
     from mmap_ninja.ragged import RaggedMmap  # type: ignore[import-not-found]
 
-    from microwakeword.audio.augmentation import Augmentation
     from microwakeword.audio.clips import Clips
     from microwakeword.audio.spectrograms import SpectrogramGeneration
+
+    if not impulse_paths or not background_paths:
+        impulse_paths, background_paths = ensure_augmentation_datasets()
 
     features_dir.mkdir(parents=True, exist_ok=True)
     clips = Clips(
@@ -549,26 +791,20 @@ def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> Non
         random_split_seed=10,
         split_count=0.1,
     )
-
-    augmenter = Augmentation(
-        augmentation_duration_s=3.2,
-        augmentation_probabilities={
-            "SevenBandParametricEQ": 0.05,
-            "TanhDistortion": 0.05,
-            "PitchShift": 0.05,
-            "BandStopFilter": 0.05,
-            "AddColorNoise": 0.05,
-            "AddBackgroundNoise": 0.0,
-            "Gain": 1.0,
-            "RIR": 0.0,
-        },
-        impulse_paths=[],
-        background_paths=[],
-        background_min_snr_db=-5,
-        background_max_snr_db=10,
-        min_jitter_s=0.195,
-        max_jitter_s=0.205,
+    train_augmenter = _build_augmenter(
+        TRAIN_AUGMENTATION_PROBABILITIES, impulse_paths, background_paths
     )
+    test_augmenter = _build_augmenter(
+        TEST_AUGMENTATION_PROBABILITIES, impulse_paths, background_paths
+    )
+    heldout_clips = None
+    if heldout_samples_dir is not None and list(Path(heldout_samples_dir).rglob("*.wav")):
+        heldout_clips = Clips(
+            input_directory=str(heldout_samples_dir),
+            file_pattern="**/*.wav",
+            remove_silence=False,
+            random_split_seed=None,
+        )
 
     for split in ("training", "validation", "testing"):
         split_dir = features_dir / split
@@ -581,30 +817,37 @@ def generate_positive_feature_sets(samples_dir: Path, features_dir: Path) -> Non
         split_dir.mkdir(parents=True, exist_ok=True)
 
         if split == "training":
-            split_name = "train"
-            repetition = 2
             spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
+                clips=clips, augmenter=train_augmenter, slide_frames=10, step_ms=10
             )
+            generator = spectrograms.spectrogram_generator(split="train", repeat=2)
         elif split == "validation":
-            split_name = "validation"
-            repetition = 1
             spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10
+                clips=clips, augmenter=train_augmenter, slide_frames=10, step_ms=10
             )
+            generator = spectrograms.spectrogram_generator(split="validation", repeat=1)
+        elif heldout_clips is not None:
+            spectrograms = SpectrogramGeneration(
+                clips=heldout_clips,
+                augmenter=test_augmenter,
+                slide_frames=1,
+                step_ms=10,
+            )
+            generator = spectrograms.spectrogram_generator(repeat=1)
         else:
-            split_name = "test"
-            repetition = 1
             spectrograms = SpectrogramGeneration(
-                clips=clips, augmenter=augmenter, slide_frames=1, step_ms=10
+                clips=clips, augmenter=test_augmenter, slide_frames=1, step_ms=10
             )
+            generator = spectrograms.spectrogram_generator(split="test", repeat=1)
 
-        logging.info("creating positive feature set for %s", split)
+        logging.info(
+            "creating positive feature set for %s (heldout=%s)",
+            split,
+            heldout_clips is not None and split == "testing",
+        )
         RaggedMmap.from_generator(
             out_dir=str(mmap_dir),
-            sample_generator=spectrograms.spectrogram_generator(
-                split=split_name, repeat=repetition
-            ),
+            sample_generator=generator,
             batch_size=100,
             verbose=True,
         )
@@ -1016,6 +1259,9 @@ def run_pipeline(
     session_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    heldout_dir = session_dir / "heldout_samples"
+    heldout_count = max(40, int(req.max_samples * 0.1))
+
     start_time = time.time()
     synthetic_cache_hit = False
     synthetic_cache_root = cache_dir / "synthetic_asset_cache"
@@ -1026,6 +1272,7 @@ def run_pipeline(
             req.max_samples,
             samples_dir,
             features_dir,
+            heldout_dir=heldout_dir,
         )
 
     stage("synthesize")
@@ -1036,12 +1283,33 @@ def run_pipeline(
             max_samples=req.max_samples,
             batch_size=req.sample_batch_size,
         )
+        ensure_wakeword_samples(
+            wakeword=wakeword,
+            samples_dir=heldout_dir,
+            max_samples=heldout_count,
+            batch_size=req.sample_batch_size,
+            voice_model=DEFAULT_TEST_VOICE_MODEL,
+            voice_config=DEFAULT_TEST_VOICE_CONFIG,
+            voice_url=DEFAULT_TEST_VOICE_URL,
+            voice_config_url=DEFAULT_TEST_VOICE_CONFIG_URL,
+        )
 
     stage("negatives")
     ensure_negative_datasets(negatives_dir)
 
+    stage("augmentation")
+    impulse_paths, background_paths = ensure_augmentation_datasets(
+        Path(os.getenv("MICROWAKEWORD_AUGMENTATION_DIR", str(DEFAULT_AUGMENTATION_DIR)))
+    )
+
     stage("features")
-    generate_positive_feature_sets(samples_dir, features_dir)
+    generate_positive_feature_sets(
+        samples_dir,
+        features_dir,
+        heldout_samples_dir=heldout_dir if not use_external_samples else None,
+        impulse_paths=impulse_paths,
+        background_paths=background_paths,
+    )
     if not use_external_samples and not synthetic_cache_hit:
         publish_synthetic_asset_cache(
             synthetic_cache_root,
@@ -1049,6 +1317,7 @@ def run_pipeline(
             req.max_samples,
             samples_dir,
             features_dir,
+            heldout_dir=heldout_dir,
         )
     custom_negative_features_dir = None
     if custom_negative_dir:
@@ -1079,6 +1348,22 @@ def run_pipeline(
     model_path = locate_tflite_model(train_dir)
     output_model = output_dir / f"{slug}.tflite"
     shutil.copy2(model_path, output_model)
+
+    stage("probe")
+    from microwakeword.domain_probe import list_wavs, probe_exported_model
+
+    probe_samples = list_wavs(samples_dir, limit=32)
+    quality_path = session_dir / "quality_report.json"
+    quality = probe_exported_model(
+        model_path=model_path,
+        sample_wavs=probe_samples,
+        impulse_dir=Path(impulse_paths[0]),
+        noise_dir=Path(background_paths[0]),
+        output_path=quality_path,
+    )
+    shutil.copy2(quality_path, output_dir / f"{slug}.quality.json")
+    if quality["quality_warning"]:
+        logging.warning("quality gate: %s", quality["quality_message"])
 
     duration = timedelta(seconds=int(time.time() - start_time))
     logging.info(

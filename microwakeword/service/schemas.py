@@ -47,6 +47,11 @@ class JobResponse(BaseModel):
     early_stopped: bool = False
     stop_reason: Optional[str] = None
     timings: Optional[dict[str, float]] = None
+    suggested_cutoff: Optional[float] = None
+    quality_warning: bool = False
+    quality_message: Optional[str] = None
+    score_report: Optional[dict[str, Any]] = None
+    quality_verdict: Optional[str] = None
 
 
 class JobListResponse(BaseModel):

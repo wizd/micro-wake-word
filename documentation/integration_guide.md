@@ -142,6 +142,9 @@ Webhook 另有可选 HMAC，见 [§6](#6-webhook)。
 | `model_url` | **相对路径** `/api/v1/jobs/{job_id}/model`（成功时）；需自行拼接服务 Base URL |
 | `webhook_url` / `metadata` | 创建时传入的值 |
 | `training_steps` / `max_samples` | 实际采用的参数 |
+| `suggested_cutoff` | 训练结束后用增强正样本打分得到的建议 `probability_cutoff` |
+| `quality_warning` / `quality_message` / `quality_verdict` | 增强正样本中位数过低时为 true，并给出原因 |
+| `score_report` | `clean` / `rir` / `rir_noise` 三档滑窗峰值分位数 |
 
 ### 4.4 `GET /healthz`
 

@@ -14,12 +14,7 @@
 # limitations under the License.
 
 import numpy as np
-import tensorflow as tf
-import webrtcvad
 
-from tensorflow.lite.experimental.microfrontend.python.ops import (
-    audio_microfrontend_op as frontend_op,
-)
 from scipy.io import wavfile
 
 from pymicro_features import MicroFrontend
@@ -62,6 +57,11 @@ def generate_features_for_clip(
                 features.append(frontend_result.features)
 
         return np.array(features).astype(np.float32)
+
+    import tensorflow as tf
+    from tensorflow.lite.experimental.microfrontend.python.ops import (
+        audio_microfrontend_op as frontend_op,
+    )
 
     with tf.device("/cpu:0"):
         # The default settings match the TFLM preprocessor settings.
@@ -113,6 +113,8 @@ def remove_silence_webrtc(
     Returns:
         numpy.ndarray: Array with the trimmed audio clip's samples.
     """
+    import webrtcvad
+
     vad = webrtcvad.Vad(0)
 
     # webrtcvad expects int16 arrays as input, so convert if audio_data is a float

@@ -89,6 +89,11 @@ def _to_response(
         early_stopped=bool(record.get("early_stopped", False)),
         stop_reason=record.get("stop_reason"),
         timings=record.get("timings"),
+        suggested_cutoff=record.get("suggested_cutoff"),
+        quality_warning=bool(record.get("quality_warning", False)),
+        quality_message=record.get("quality_message"),
+        score_report=record.get("score_report"),
+        quality_verdict=record.get("quality_verdict"),
     )
 
 
@@ -100,12 +105,20 @@ def create_app(config: Optional[ServiceConfig] = None) -> FastAPI:
     config.assets_dir.mkdir(parents=True, exist_ok=True)
     config.piper_dir.mkdir(parents=True, exist_ok=True)
     config.negatives_dir.mkdir(parents=True, exist_ok=True)
+    config.augmentation_dir.mkdir(parents=True, exist_ok=True)
 
     # Ensure pipeline env points at shared assets
     os.environ.setdefault("MICROWAKEWORD_VOICE_MODEL", str(config.voice_model))
     os.environ.setdefault("MICROWAKEWORD_VOICE_CONFIG", str(config.voice_config))
     os.environ.setdefault(
         "MICROWAKEWORD_NEGATIVE_DATASETS_DIR", str(config.negatives_dir)
+    )
+    os.environ.setdefault(
+        "MICROWAKEWORD_AUGMENTATION_DIR", str(config.augmentation_dir)
+    )
+    os.environ.setdefault("MICROWAKEWORD_TEST_VOICE_MODEL", str(config.test_voice_model))
+    os.environ.setdefault(
+        "MICROWAKEWORD_TEST_VOICE_CONFIG", str(config.test_voice_config)
     )
 
     store = JobStore(config.store_path)

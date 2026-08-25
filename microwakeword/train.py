@@ -514,6 +514,12 @@ def train(model, config, data_processor, prefetcher=None):
     early_stop_stale_evals = 0
     stop_reason = None
     actual_training_steps = 0
+    best_weights_updated_count = 0
+    best_weights_last_step = 0
+    best_weights_stale_evals = 0
+    best_weights_stale_warn = max(
+        1, int(os.getenv("MICROWAKEWORD_BEST_WEIGHTS_STALE_EVALS", "5"))
+    )
 
     perf = {
         "batch_wait_seconds": 0.0,
@@ -758,12 +764,29 @@ def train(model, config, data_processor, prefetcher=None):
                 best_minimization_quantity = current_minimization_quantity
                 best_maximization_quantity = current_maximization_quantity
                 best_no_faph_cutoff = current_no_faph_cutoff
+                best_weights_updated_count += 1
+                best_weights_last_step = training_step
+                best_weights_stale_evals = 0
 
                 # overwrite the best model weights
                 model.save_weights(
                     os.path.join(config["train_dir"], "best_weights.weights.h5")
                 )
                 checkpoint.save(file_prefix=checkpoint_prefix)
+            else:
+                best_weights_stale_evals += 1
+                if (
+                    best_weights_stale_evals == best_weights_stale_warn
+                    or best_weights_stale_evals % best_weights_stale_warn == 0
+                ):
+                    logging.warning(
+                        "best_weights frozen for %d evaluations "
+                        "(last update step=%d metric=%.6f); current metric=%.6f",
+                        best_weights_stale_evals,
+                        best_weights_last_step,
+                        best_maximization_quantity,
+                        current_maximization_quantity,
+                    )
 
             logging.info(
                 "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
@@ -821,6 +844,9 @@ def train(model, config, data_processor, prefetcher=None):
         "early_stopped": bool(stop_reason),
         "stop_reason": stop_reason,
         "best_step_metric": float(early_stop_best),
+        "best_weights_updated_count": int(best_weights_updated_count),
+        "best_weights_last_step": int(best_weights_last_step),
+        "best_weights_stale_evals": int(best_weights_stale_evals),
         "timings": {
             **perf,
             "validation_cache_seconds": validation_cache_seconds,

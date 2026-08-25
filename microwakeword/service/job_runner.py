@@ -68,6 +68,10 @@ def main() -> None:
         )
         if metadata_files:
             metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+        quality = {}
+        quality_path = Path(args.request_json).parent / "quality_report.json"
+        if quality_path.exists():
+            quality = json.loads(quality_path.read_text(encoding="utf-8"))
         Path(args.result_file).write_text(
             json.dumps(
                 {
@@ -77,6 +81,11 @@ def main() -> None:
                     "early_stopped": metadata.get("early_stopped", False),
                     "stop_reason": metadata.get("stop_reason"),
                     "timings": metadata.get("timings"),
+                    "suggested_cutoff": quality.get("suggested_cutoff"),
+                    "quality_warning": quality.get("quality_warning", False),
+                    "quality_message": quality.get("quality_message"),
+                    "score_report": quality.get("variants"),
+                    "quality_verdict": quality.get("verdict"),
                 }
             ),
             encoding="utf-8",

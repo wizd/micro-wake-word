@@ -256,6 +256,11 @@ class TrainingWorker:
                         "early_stopped": bool(result.get("early_stopped", False)),
                         "stop_reason": result.get("stop_reason"),
                         "timings": result.get("timings"),
+                        "suggested_cutoff": result.get("suggested_cutoff"),
+                        "quality_warning": bool(result.get("quality_warning", False)),
+                        "quality_message": result.get("quality_message"),
+                        "score_report": result.get("score_report"),
+                        "quality_verdict": result.get("quality_verdict"),
                     }
                     final_status = "succeeded"
                 elif result.get("cancelled"):
@@ -311,6 +316,12 @@ class TrainingWorker:
                 "model_path": str(model_path) if model_path else None,
                 "duration_seconds": duration,
                 "metadata": record.get("metadata") or {},
+                "suggested_cutoff": (updated or current).get("suggested_cutoff"),
+                "quality_warning": bool(
+                    (updated or current).get("quality_warning", False)
+                ),
+                "quality_message": (updated or current).get("quality_message"),
+                "quality_verdict": (updated or current).get("quality_verdict"),
             }
             deliver_webhook(
                 webhook_url,

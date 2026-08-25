@@ -53,6 +53,18 @@ class ServiceConfig:
     def voice_config(self) -> Path:
         return self.piper_dir / "zh_CN-huayan-medium.onnx.json"
 
+    @property
+    def test_voice_model(self) -> Path:
+        return self.piper_dir / "zh_CN-huayan-x_low.onnx"
+
+    @property
+    def test_voice_config(self) -> Path:
+        return self.piper_dir / "zh_CN-huayan-x_low.onnx.json"
+
+    @property
+    def augmentation_dir(self) -> Path:
+        return self.assets_dir / "augmentation-datasets"
+
 
 def load_config() -> ServiceConfig:
     return ServiceConfig(
